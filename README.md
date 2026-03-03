@@ -14,6 +14,8 @@ cmake --build build
 
 ## Usage
 
+![image](assets/image.png)
+
 Download a supported model (e.g. `Qwen3.5-0.8B` in safetensors format), then:
 
 ```bash
