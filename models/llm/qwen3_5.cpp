@@ -159,6 +159,7 @@ void Qwen35Model::apply_args(const Qwen35Args& args) {
 }
 
 bool Qwen35Model::load(const std::string& model_dir) {
+    model_dir_ = model_dir;
     std::string config_path = model_dir + "/config.json";
     std::ifstream f(config_path);
     if (!f.is_open()) {
@@ -429,11 +430,6 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
     int cached = ane_cache_loads();
     LOG("  %d ANE layer kernels ready (compiled=%d, cached=%d)\n",
         compiled + cached, compiled, cached);
-
-    // Pre-compile Metal weights (available for --use-metal mode)
-    if (metal_available()) {
-        compile_metal_weights(sf);
-    }
 
     if (!compile_lm_head_ane(sf, blob_dir)) {
         LOG("ANE LM head disabled, falling back to CPU\n");
@@ -816,10 +812,16 @@ float* Qwen35Model::forward(int token, int pos) {
 
 void Qwen35Model::set_use_metal(bool v) {
     use_metal_matmul_ = v;
-    if (v && metal_layers_.empty()) {
-        // Need to initialize Metal weight buffers - but ModelWeights is gone
-        // The weights will be compiled lazily if sf is available during load
-        LOG("Metal mode enabled (weights will be compiled if available)\n");
+    if (v && metal_available()) {
+        // Lazy-load Metal weights by re-opening safetensors
+        auto sf = ModelWeights::open(model_dir_);
+        if (sf) {
+            compile_metal_weights(sf.get());
+            LOG("Metal GPU weights compiled for %d layers\n", num_layers_);
+        } else {
+            fprintf(stderr, "Warning: could not open weights for Metal compilation\n");
+            use_metal_matmul_ = false;
+        }
     }
 }
 

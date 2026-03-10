@@ -165,7 +165,8 @@ private:
         MetalWeight* down_proj = nullptr;
     };
     std::vector<LayerMetalWeights> metal_layers_;
-    bool use_metal_matmul_ = false;  // set by --use-metal flag
+    bool use_metal_matmul_ = false;
+    std::string model_dir_;  // for lazy Metal weight loading  // set by --use-metal flag
 
     // LM head ANE kernels
     std::vector<ANEKernel*> lm_head_kernels_;
