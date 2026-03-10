@@ -1,6 +1,9 @@
 #include "cpu_ops.h"
 #include <alloca.h>
 #include <dispatch/dispatch.h>
+#if defined(__aarch64__) || defined(__arm64__)
+#include <arm_neon.h>
+#endif
 
 namespace ane_lm {
 
@@ -38,16 +41,49 @@ void rmsnorm_gated(float* out, const float* x, const float* z,
     vDSP_vmul(out, 1, z, 1, out, 1, (vDSP_Length)dim);
 }
 
-// ============ BUGFIX + PERF: NEON alternating-pairs RoPE ============
-// Correct implementation for (v[2j], v[2j+1]) rotation using vld2/vst2.
-// vld2q_f32 de-interleaves: .val[0] = even elements, .val[1] = odd elements.
-// This lets us apply cos/sin to all pairs simultaneously with SIMD.
-
+// ============ PERF: NEON alternating-pairs RoPE via vld2q_f32/vst2q_f32 ============
+// Correct for (v[2j], v[2j+1]) pairs. vld2 de-interleaves: val[0]=even, val[1]=odd.
+// Process 4 pairs (8 floats) per iteration using vmlsq/vmlaq SIMD ops.
+#if defined(__aarch64__) || defined(__arm64__)
+static void apply_rope_neon_pairs(float* v, const float* cos_row,
+                                   const float* sin_row, int rot_dim) {
+    int half = rot_dim / 2;  // number of pairs
+    int j = 0;
+    for (; j + 3 < half; j += 4) {
+        float32x4x2_t vp = vld2q_f32(&v[j * 2]);
+        float32x4_t cos4 = vld1q_f32(&cos_row[j]);
+        float32x4_t sin4 = vld1q_f32(&sin_row[j]);
+        // new_even = even * cos - odd * sin
+        float32x4_t new_even = vmlsq_f32(vmulq_f32(vp.val[0], cos4), vp.val[1], sin4);
+        // new_odd  = even * sin + odd * cos
+        float32x4_t new_odd  = vmlaq_f32(vmulq_f32(vp.val[0], sin4), vp.val[1], cos4);
+        float32x4x2_t result = {new_even, new_odd};
+        vst2q_f32(&v[j * 2], result);
+    }
+    // Scalar tail
+    for (; j < half; j++) {
+        float v0 = v[j * 2], v1 = v[j * 2 + 1];
+        v[j * 2]     = v0 * cos_row[j] - v1 * sin_row[j];
+        v[j * 2 + 1] = v0 * sin_row[j] + v1 * cos_row[j];
+    }
+}
+#endif
 
 void apply_rope_cached(float* q, float* k, int n_q_heads, int n_kv_heads,
                        int head_dim, int q_head_stride, int k_head_stride,
                        int rot_dim, int pos, float theta,
                        const float* cos_row, const float* sin_row) {
+#if defined(__aarch64__) || defined(__arm64__)
+    if (cos_row && sin_row) {
+        // NEON fast path: correct alternating-pairs rotation with vld2/vst2
+        for (int h = 0; h < n_q_heads + n_kv_heads; h++) {
+            float* v = (h < n_q_heads) ? q + h * q_head_stride : k + (h - n_q_heads) * k_head_stride;
+            apply_rope_neon_pairs(v, cos_row, sin_row, rot_dim);
+        }
+        return;
+    }
+#endif
+    // Scalar fallback (no precomputed trig tables)
     for (int h = 0; h < n_q_heads + n_kv_heads; h++) {
         float* v = (h < n_q_heads) ? q + h * q_head_stride : k + (h - n_q_heads) * k_head_stride;
         for (int i = 0, j = 0; i < rot_dim; i += 2, j++) {

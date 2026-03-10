@@ -8,6 +8,9 @@
 #include <vector>
 #include <string>
 #include <mach/mach_time.h>
+#if defined(__aarch64__) || defined(__arm64__)
+#include <arm_neon.h>
+#endif
 
 namespace ane_lm {
 
@@ -79,7 +82,22 @@ inline void bf16_to_f32_vec(float *out, const uint16_t *in, int n) {
 }
 
 inline void bf16_to_f16_vec(uint16_t *out, const uint16_t *in, int n) {
+#if defined(__aarch64__) || defined(__arm64__)
+    // NEON: BF16->F32 via vshll_n_u16 (upper 16 bits = float32), then F32->F16 via vcvt
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        uint16x8_t bf = vld1q_u16(&in[i]);
+        uint16x4_t bf_lo = vget_low_u16(bf);
+        uint16x4_t bf_hi = vget_high_u16(bf);
+        float32x4_t f32_lo = vreinterpretq_f32_u32(vshll_n_u16(bf_lo, 16));
+        float32x4_t f32_hi = vreinterpretq_f32_u32(vshll_n_u16(bf_hi, 16));
+        vst1_u16(&out[i],   vreinterpret_u16_f16(vcvt_f16_f32(f32_lo)));
+        vst1_u16(&out[i+4], vreinterpret_u16_f16(vcvt_f16_f32(f32_hi)));
+    }
+    for (; i < n; i++) out[i] = bf16_to_f16(in[i]);
+#else
     for (int i = 0; i < n; i++) out[i] = bf16_to_f16(in[i]);
+#endif
 }
 
 // Timing utility
