@@ -533,6 +533,7 @@ float* Qwen3Model::forward(int token_id, int pos) {
     if (ane_lm_head_enabled_ && !lm_head_kernels_.empty()) {
         int chunks = (int)lm_head_kernels_.size();
         std::atomic<bool> lm_ok{true};
+        auto* lm_ok_ptr = &lm_ok;
         int chunk_sz = lm_head_chunk_;
         int vocab = vocab_size_;
         float* x_ptr = x_;
@@ -542,13 +543,13 @@ float* Qwen3Model::forward(int token_id, int pos) {
         dispatch_apply(chunks,
             dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
             ^(size_t c) {
-                if (!lm_ok.load(std::memory_order_relaxed)) return;
+                if (!lm_ok_ptr->load(std::memory_order_relaxed)) return;
                 int offset = (int)c * chunk_sz;
                 int rows = vocab - offset;
                 if (rows > chunk_sz) rows = chunk_sz;
                 if (!ane_matvec(lm_head_kernels_[c],
                                 logits_ptr + offset, x_ptr, hsz, rows)) {
-                    lm_ok.store(false, std::memory_order_relaxed);
+                    lm_ok_ptr->store(false, std::memory_order_relaxed);
                 }
             });
         if (!lm_ok.load()) {
