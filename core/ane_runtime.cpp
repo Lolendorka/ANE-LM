@@ -619,19 +619,11 @@ bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int
     }
     uint16_t* in_base = (uint16_t*)IOSurfaceGetBaseAddress(in_surface);
 #if defined(__aarch64__) || defined(__arm64__)
-    // NEON batched f32->fp16 scatter: 4-wide convert + individual stride-32 stores
     {
         __fp16* in_h = (__fp16*)in_base;
-        int c = 0, idx = 0;
-        for (; c + 3 < in_dim; c += 4, idx += 4 * ANE_SPATIAL) {
-            float32x4_t v = vld1q_f32(&input[c]);
-            float16x4_t h = vcvt_f16_f32(v);
-            in_h[idx + 0 * ANE_SPATIAL] = vget_lane_f16(h, 0);
-            in_h[idx + 1 * ANE_SPATIAL] = vget_lane_f16(h, 1);
-            in_h[idx + 2 * ANE_SPATIAL] = vget_lane_f16(h, 2);
-            in_h[idx + 3 * ANE_SPATIAL] = vget_lane_f16(h, 3);
-        }
-        for (; c < in_dim; c++, idx += ANE_SPATIAL) in_h[idx] = (__fp16)input[c];
+#pragma clang loop vectorize(enable)
+        for (int c = 0, idx = 0; c < in_dim; c++, idx += ANE_SPATIAL)
+            in_h[idx] = (__fp16)input[c];
     }
 #else
     for (int c = 0, idx = 0; c < in_dim; c++, idx += ANE_SPATIAL)
@@ -648,19 +640,11 @@ bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int
     }
     const uint16_t* out_base = (const uint16_t*)IOSurfaceGetBaseAddress(out_surface);
 #if defined(__aarch64__) || defined(__arm64__)
-    // NEON batched fp16->f32 gather: read 4 strided elements, vcvt, store contiguous
     {
         const __fp16* out_h = (const __fp16*)out_base;
-        int c = 0, idx = 0;
-        for (; c + 3 < out_dim; c += 4, idx += 4 * ANE_SPATIAL) {
-            // Proper aggregate init (avoids UB with uninitialized float16x4_t)
-            float16_t hv[4] = {
-                out_h[idx + 0*ANE_SPATIAL], out_h[idx + 1*ANE_SPATIAL],
-                out_h[idx + 2*ANE_SPATIAL], out_h[idx + 3*ANE_SPATIAL]
-            };
-            vst1q_f32(&output[c], vcvt_f32_f16(vld1_f16(hv)));
-        }
-        for (; c < out_dim; c++, idx += ANE_SPATIAL) output[c] = (float)out_h[idx];
+#pragma clang loop vectorize(enable)
+        for (int c = 0, idx = 0; c < out_dim; c++, idx += ANE_SPATIAL)
+            output[c] = (float)out_h[idx];
     }
 #else
     for (int c = 0, idx = 0; c < out_dim; c++, idx += ANE_SPATIAL)
