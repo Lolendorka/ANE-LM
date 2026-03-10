@@ -4,6 +4,9 @@
 #include <objc/runtime.h>
 #include <objc/message.h>
 #include <dlfcn.h>
+#if defined(__aarch64__) || defined(__arm64__)
+#include <arm_neon.h>
+#endif
 #include <IOSurface/IOSurface.h>
 #include <cstdio>
 #include <cstdlib>
@@ -615,17 +618,25 @@ bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int
         return false;
     }
     uint16_t* in_base = (uint16_t*)IOSurfaceGetBaseAddress(in_surface);
-#if ANE_USE_NATIVE_FP16
-    ane_fp16_t* in_base_h = (ane_fp16_t*)in_base;
-#endif
-#pragma clang loop vectorize(enable)
-    for (int c = 0, idx = 0; c < in_dim; c++, idx += ANE_SPATIAL) {
-#if ANE_USE_NATIVE_FP16
-        in_base_h[idx] = (ane_fp16_t)input[c];
+#if defined(__aarch64__) || defined(__arm64__)
+    // NEON batched f32->fp16 scatter: 4-wide convert + individual stride-32 stores
+    {
+        __fp16* in_h = (__fp16*)in_base;
+        int c = 0, idx = 0;
+        for (; c + 3 < in_dim; c += 4, idx += 4 * ANE_SPATIAL) {
+            float32x4_t v = vld1q_f32(&input[c]);
+            float16x4_t h = vcvt_f16_f32(v);
+            in_h[idx + 0 * ANE_SPATIAL] = vget_lane_f16(h, 0);
+            in_h[idx + 1 * ANE_SPATIAL] = vget_lane_f16(h, 1);
+            in_h[idx + 2 * ANE_SPATIAL] = vget_lane_f16(h, 2);
+            in_h[idx + 3 * ANE_SPATIAL] = vget_lane_f16(h, 3);
+        }
+        for (; c < in_dim; c++, idx += ANE_SPATIAL) in_h[idx] = (__fp16)input[c];
+    }
 #else
+    for (int c = 0, idx = 0; c < in_dim; c++, idx += ANE_SPATIAL)
         in_base[idx] = f32_to_f16(input[c]);
 #endif
-    }
     IOSurfaceUnlock(in_surface, 0, NULL);
 
     if (!ane_eval_raw(k)) return false;
@@ -636,17 +647,25 @@ bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int
         return false;
     }
     const uint16_t* out_base = (const uint16_t*)IOSurfaceGetBaseAddress(out_surface);
-#if ANE_USE_NATIVE_FP16
-    const ane_fp16_t* out_base_h = (const ane_fp16_t*)out_base;
-#endif
-#pragma clang loop vectorize(enable)
-    for (int c = 0, idx = 0; c < out_dim; c++, idx += ANE_SPATIAL) {
-#if ANE_USE_NATIVE_FP16
-        output[c] = (float)out_base_h[idx];
+#if defined(__aarch64__) || defined(__arm64__)
+    // NEON batched fp16->f32 gather: read 4 strided elements, vcvt, store contiguous
+    {
+        const __fp16* out_h = (const __fp16*)out_base;
+        int c = 0, idx = 0;
+        for (; c + 3 < out_dim; c += 4, idx += 4 * ANE_SPATIAL) {
+            float16x4_t h;
+            h = vset_lane_f16(out_h[idx + 0*ANE_SPATIAL], h, 0);
+            h = vset_lane_f16(out_h[idx + 1*ANE_SPATIAL], h, 1);
+            h = vset_lane_f16(out_h[idx + 2*ANE_SPATIAL], h, 2);
+            h = vset_lane_f16(out_h[idx + 3*ANE_SPATIAL], h, 3);
+            vst1q_f32(&output[c], vcvt_f32_f16(h));
+        }
+        for (; c < out_dim; c++, idx += ANE_SPATIAL) output[c] = (float)out_h[idx];
+    }
 #else
+    for (int c = 0, idx = 0; c < out_dim; c++, idx += ANE_SPATIAL)
         output[c] = f16_to_f32(out_base[idx]);
 #endif
-    }
     IOSurfaceUnlock(out_surface, kIOSurfaceLockReadOnly, NULL);
 
     return true;
