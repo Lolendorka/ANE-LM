@@ -1,13 +1,29 @@
 #include "qwen3.h"
 #include "../../core/cpu_ops.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <dispatch/dispatch.h>
 #include <fstream>
 #include <sys/stat.h>
 
 namespace ane_lm {
 
 using json = nlohmann::json;
+
+// ============ PATCH 5: vDSP RoPE for Qwen3 (interleaved layout) ============
+// Qwen3 uses interleaved layout: [cos(x0), cos(x1), ..., cos(xH/2-1)] applied to
+// first half, second half separately (not alternating pairs like GPT-NeoX)
+static void apply_rope_head_qwen3_vdsp(float* v, const float* cos_row,
+                                        const float* sin_row, int half) {
+    float* tmp = (float*)alloca(half * sizeof(float));
+    vDSP_Length n = (vDSP_Length)half;
+    // tmp     = v[0..half] * cos - v[half..] * sin
+    vDSP_vmmsb(v, 1, cos_row, 1, v + half, 1, sin_row, 1, tmp, 1, n);
+    // v[half..] = v[half..] * cos + v[0..half] * sin
+    vDSP_vmma(v + half, 1, cos_row, 1, v, 1, sin_row, 1, v + half, 1, n);
+    memcpy(v, tmp, half * sizeof(float));
+}
 
 static void apply_rope_qwen3(
     float* q, float* k,
@@ -17,21 +33,20 @@ static void apply_rope_qwen3(
     int half = head_dim / 2;
     for (int h = 0; h < n_q_heads + n_kv_heads; h++) {
         float* v = (h < n_q_heads) ? q + (size_t)h * head_dim : k + (size_t)(h - n_q_heads) * head_dim;
-        for (int i = 0; i < half; i++) {
-            float cos_a, sin_a;
-            if (cos_row && sin_row) {
-                cos_a = cos_row[i];
-                sin_a = sin_row[i];
-            } else {
+        if (cos_row && sin_row) {
+            apply_rope_head_qwen3_vdsp(v, cos_row, sin_row, half);
+        } else {
+            // Fallback scalar (should not happen with precomputed cache)
+            for (int i = 0; i < half; i++) {
                 float freq = 1.0f / powf(theta, (float)(2 * i) / (float)head_dim);
                 float angle = pos * freq;
-                cos_a = cosf(angle);
-                sin_a = sinf(angle);
+                float cos_a = cosf(angle);
+                float sin_a = sinf(angle);
+                float v0 = v[i];
+                float v1 = v[i + half];
+                v[i]      = v0 * cos_a - v1 * sin_a;
+                v[i+half] = v1 * cos_a + v0 * sin_a;
             }
-            float v0 = v[i];
-            float v1 = v[i + half];
-            v[i] = v0 * cos_a - v1 * sin_a;
-            v[i + half] = v1 * cos_a + v0 * sin_a;
         }
     }
 }
@@ -132,7 +147,6 @@ void Qwen3Model::apply_args(const Qwen3Args& args) {
 }
 
 bool Qwen3Model::load(const std::string& model_dir) {
-    // 1. Read config.json and parse args
     std::string config_path = model_dir + "/config.json";
     std::ifstream f(config_path);
     if (!f.is_open()) {
@@ -143,14 +157,12 @@ bool Qwen3Model::load(const std::string& model_dir) {
     Qwen3Args args = Qwen3Args::from_json(j);
     apply_args(args);
 
-    // 2. Open model weights (single-file or sharded)
     auto sf = ModelWeights::open(model_dir);
     if (!sf) {
         fprintf(stderr, "Failed to open model weights in %s\n", model_dir.c_str());
         return false;
     }
 
-    // Infer dims from safetensors
     const SFTensor* embed = sf->find("model.embed_tokens.weight");
     if (!embed || embed->ndims != 2) {
         fprintf(stderr, "Cannot infer dims: missing or invalid model.embed_tokens.weight\n");
@@ -177,7 +189,6 @@ bool Qwen3Model::load(const std::string& model_dir) {
     LOG("Model dims: hidden=%d intermediate=%d vocab=%d layers=%d\n",
         hidden_size_, intermediate_size_, vocab_size_, num_layers_);
 
-    // 3. Init ANE
     ane_init();
 
     x_ = (float*)calloc(hidden_size_, sizeof(float));
@@ -191,19 +202,18 @@ bool Qwen3Model::load(const std::string& model_dir) {
     rope_cos_ = (float*)calloc((size_t)rope_cache_len_ * half_rot, sizeof(float));
     rope_sin_ = (float*)calloc((size_t)rope_cache_len_ * half_rot, sizeof(float));
 
-    // Precompute RoPE trig table for common context lengths.
     if (rope_cos_ && rope_sin_ && half_rot > 0) {
         std::vector<float> inv_freq((size_t)half_rot);
-        for (int j = 0, i = 0; i < rot_dim_; i += 2, j++) {
-            inv_freq[(size_t)j] = 1.0f / powf(rope_theta_, (float)i / (float)rot_dim_);
+        for (int j2 = 0, i = 0; i < rot_dim_; i += 2, j2++) {
+            inv_freq[(size_t)j2] = 1.0f / powf(rope_theta_, (float)i / (float)rot_dim_);
         }
         for (int pos = 0; pos < rope_cache_len_; pos++) {
             float* cos_row = rope_cos_ + (size_t)pos * half_rot;
             float* sin_row = rope_sin_ + (size_t)pos * half_rot;
-            for (int j = 0; j < half_rot; j++) {
-                float angle = pos * inv_freq[(size_t)j];
-                cos_row[j] = cosf(angle);
-                sin_row[j] = sinf(angle);
+            for (int j2 = 0; j2 < half_rot; j2++) {
+                float angle = pos * inv_freq[(size_t)j2];
+                cos_row[j2] = cosf(angle);
+                sin_row[j2] = sinf(angle);
             }
         }
     }
@@ -221,7 +231,6 @@ bool Qwen3Model::load(const std::string& model_dir) {
         kv.capacity = KV_CACHE_CAPACITY;
     }
 
-    // 4. Load weights + compile ANE kernels
     if (!load_weights(sf.get())) {
         return false;
     }
@@ -281,7 +290,6 @@ bool Qwen3Model::load_weights(ModelWeights* sf) {
     return true;
 }
 
-// Convert tensor name to blob path: "a.b.c" -> "<dir>/a/b/c.bin"
 static std::string blob_path(const std::string& dir, const char* tensor_name) {
     std::string p = dir + "/";
     for (const char* c = tensor_name; *c; c++) {
@@ -394,7 +402,6 @@ bool Qwen3Model::compile_lm_head_ane(ModelWeights* sf, const std::string& blob_d
 
         LOG("    LM head chunk %d/%d...\r", c + 1, chunks);
 
-        // For blob mode we still use BF16 pointer here because lm_head is chunked dynamically.
         (void)use_blobs;
         const uint16_t* chunk_w = lm_bf16 + (int64_t)offset * hidden_size_;
         lm_head_kernels_[c] = ane_compile_matmul(chunk_w, rows, hidden_size_);
@@ -434,14 +441,24 @@ bool Qwen3Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int p
     float* k_raw = qkv_buf + q_proj_dim_;
     float* v_raw = qkv_buf + q_proj_dim_ + kv_proj_dim_;
 
-    for (int h = 0; h < num_q_heads_; h++) {
-        float* qh = q_raw + (size_t)h * head_dim_;
-        rmsnorm(qh, qh, lw.q_norm, head_dim_, rms_eps_);
-    }
-    for (int h = 0; h < num_kv_heads_; h++) {
-        float* kh = k_raw + (size_t)h * head_dim_;
-        rmsnorm(kh, kh, lw.k_norm, head_dim_, rms_eps_);
-    }
+    // ============ PATCH 6: Parallel Q/K per-head RMSNorm via dispatch_apply ============
+    // All heads are independent (disjoint memory regions)
+    int nqh = num_q_heads_, nkh = num_kv_heads_;
+    float eps = rms_eps_;
+    float* q_n = lw.q_norm;
+    float* k_n = lw.k_norm;
+    int hd = head_dim_;
+    dispatch_apply(nqh + nkh,
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+        ^(size_t h) {
+            if (h < (size_t)nqh) {
+                float* qh = q_raw + h * hd;
+                rmsnorm(qh, qh, q_n, hd, eps);
+            } else {
+                float* kh = k_raw + (h - nqh) * hd;
+                rmsnorm(kh, kh, k_n, hd, eps);
+            }
+        });
 
     const float* rope_cos_row = nullptr;
     const float* rope_sin_row = nullptr;
@@ -451,6 +468,7 @@ bool Qwen3Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int p
         rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
     }
 
+    // PATCH 5: vDSP RoPE
     apply_rope_qwen3(q_raw, k_raw, num_q_heads_, num_kv_heads_,
                      head_dim_, pos, rope_theta_, rope_cos_row, rope_sin_row);
 
@@ -494,9 +512,8 @@ float* Qwen3Model::forward(int token_id, int pos) {
             return nullptr;
         }
 
-        for (int i = 0; i < hidden_size_; i++) {
-            x_[i] += attn_out[i];
-        }
+        // ============ PATCH 2: vDSP_vadd for residual (was scalar loop) ============
+        vDSP_vadd(x_, 1, attn_out, 1, x_, 1, (vDSP_Length)hidden_size_);
 
         rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
 
@@ -506,27 +523,35 @@ float* Qwen3Model::forward(int token_id, int pos) {
             return nullptr;
         }
 
-        for (int i = 0; i < hidden_size_; i++) {
-            x_[i] += mlp_out[i];
-        }
+        // ============ PATCH 2: vDSP_vadd for residual (was scalar loop) ============
+        vDSP_vadd(x_, 1, mlp_out, 1, x_, 1, (vDSP_Length)hidden_size_);
     }
 
     rmsnorm(x_, x_, final_norm_, hidden_size_, rms_eps_);
 
+    // ============ PATCH 4: Parallel LM head chunks via dispatch_apply ============
     if (ane_lm_head_enabled_ && !lm_head_kernels_.empty()) {
-        bool ok = true;
         int chunks = (int)lm_head_kernels_.size();
-        for (int c = 0; c < chunks; c++) {
-            int offset = c * lm_head_chunk_;
-            int rows = vocab_size_ - offset;
-            if (rows > lm_head_chunk_) rows = lm_head_chunk_;
-            if (!ane_matvec(lm_head_kernels_[c], logits_ + offset, x_, hidden_size_, rows)) {
-                fprintf(stderr, "ANE LM head eval failed at chunk %d/%d, falling back to CPU\n", c + 1, chunks);
-                ok = false;
-                break;
-            }
-        }
-        if (!ok) {
+        std::atomic<bool> lm_ok{true};
+        int chunk_sz = lm_head_chunk_;
+        int vocab = vocab_size_;
+        float* x_ptr = x_;
+        int hsz = hidden_size_;
+        float* logits_ptr = logits_;
+        // All chunks read same x_, write to disjoint logits_ regions — safe to parallelize
+        dispatch_apply(chunks,
+            dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+            ^(size_t c) {
+                if (!lm_ok.load(std::memory_order_relaxed)) return;
+                int offset = (int)c * chunk_sz;
+                int rows = vocab - offset;
+                if (rows > chunk_sz) rows = chunk_sz;
+                if (!ane_matvec(lm_head_kernels_[c],
+                                logits_ptr + offset, x_ptr, hsz, rows)) {
+                    lm_ok.store(false, std::memory_order_relaxed);
+                }
+            });
+        if (!lm_ok.load()) {
             free_lm_head_ane();
             matvec(logits_, lm_head_, x_, vocab_size_, hidden_size_);
         }
