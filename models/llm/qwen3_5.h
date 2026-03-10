@@ -22,11 +22,8 @@ public:
     virtual float* forward(int token_id, int pos) = 0;
     virtual void reset() = 0;
     virtual int vocab_size() const = 0;
-
-    // prefill_step: run forward pass WITHOUT computing LM head logits.
-    // Used during prompt prefill to avoid ~10 wasted ANE dispatches per token.
-    // Returns true on success. Base implementation calls forward() and discards result.
-    // Override in subclasses for efficient implementation that truly skips LM head.
+    // prefill_step: runs transformer without LM head (saves ~10 ANE dispatches)
+    // Base impl calls forward() and discards result (correct but not optimized)
     virtual bool prefill_step(int token_id, int pos) {
         return forward(token_id, pos) != nullptr;
     }
@@ -70,7 +67,7 @@ public:
     ~Qwen35Model() override;
     bool load(const std::string& model_dir) override;
     float* forward(int token_id, int pos) override;
-    bool prefill_step(int token_id, int pos) override;  // efficient: skips LM head
+    bool prefill_step(int token_id, int pos) override;  // skips LM head
     void reset() override;
     int vocab_size() const override { return vocab_size_; }
 
@@ -105,6 +102,7 @@ private:
 
     std::vector<LayerType> layer_types_;
 
+    // DeltaNet weights
     struct DeltaNetWeights {
         float* in_proj_a = nullptr;
         float* in_proj_b = nullptr;
@@ -114,11 +112,13 @@ private:
         float* norm_w = nullptr;
     };
 
+    // Full attention weights
     struct FullAttnWeights {
         float* q_norm = nullptr;
         float* k_norm = nullptr;
     };
 
+    // Layer weights
     struct LayerWeights {
         LayerType type;
         DeltaNetWeights deltanet;
@@ -127,12 +127,14 @@ private:
         float* post_attention_layernorm = nullptr;
     };
 
+    // DeltaNet state
     struct DeltaNetState {
         float* ssm_state = nullptr;
         float* conv_state = nullptr;
         int conv_pos = 0;
     };
 
+    // KV cache
     struct KVCache {
         float* k_cache = nullptr;
         float* v_cache = nullptr;
@@ -141,6 +143,7 @@ private:
         int capacity = 0;
     };
 
+    // Model data
     std::vector<LayerWeights> layers_;
     float* embed_tokens_ = nullptr;
     float* final_norm_ = nullptr;
@@ -149,10 +152,13 @@ private:
     std::vector<KVCache> kv_caches_;
     std::vector<LayerANEKernels> ane_layers_;
 
+    // LM head ANE kernels
     std::vector<ANEKernel*> lm_head_kernels_;
     int lm_head_chunk_ = LM_HEAD_ANE_CHUNK_MAX;
     bool ane_lm_head_enabled_ = false;
+    bool skip_lm_head_ = false;  // set true during prefill_step
 
+    // Scratch buffers
     float* x_ = nullptr;
     float* x_norm_ = nullptr;
     float* logits_ = nullptr;
@@ -170,7 +176,6 @@ private:
     bool compile_lm_head_ane(ModelWeights* sf, const std::string& blob_dir);
     void free_lm_head_ane();
 
-    bool forward_layers(int token_id, int pos);  // shared: embedding + all layers + final norm
     bool forward_deltanet_core(int L, float* x, float* pre_oproj);
     bool forward_full_attn_core(int L, float* x, float* pre_oproj, int pos);
 };

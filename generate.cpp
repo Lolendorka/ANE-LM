@@ -45,12 +45,20 @@ void stream_generate(
         prompt_tokens = tokenizer.encode(combined);
     }
 
+    // PERF: skip LM head for intermediate prefill tokens (~10 dispatches saved/token)
     Timer prefill_timer;
     float* logits = nullptr;
-    for (int i = 0; i < (int)prompt_tokens.size(); i++) {
-        logits = model.forward(prompt_tokens[i], i);
+    if (!prompt_tokens.empty()) {
+        for (int i = 0; i < (int)prompt_tokens.size() - 1; i++) {
+            if (!model.prefill_step(prompt_tokens[i], i)) {
+                fprintf(stderr, "Prefill failed at token index %d\n", i);
+                return;
+            }
+        }
+        int last = (int)prompt_tokens.size() - 1;
+        logits = model.forward(prompt_tokens[last], last);
         if (!logits) {
-            fprintf(stderr, "Forward failed during prefill at token index %d\n", i);
+            fprintf(stderr, "Forward failed at last prefill token\n");
             return;
         }
     }

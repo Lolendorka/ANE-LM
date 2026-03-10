@@ -82,6 +82,7 @@ private:
     std::vector<ANEKernel*> lm_head_kernels_;
     int lm_head_chunk_ = LM_HEAD_ANE_CHUNK_MAX;
     bool ane_lm_head_enabled_ = false;
+    bool skip_lm_head_ = false;
 
     float* x_ = nullptr;
     float* x_norm_ = nullptr;

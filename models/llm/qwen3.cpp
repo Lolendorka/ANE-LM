@@ -352,6 +352,9 @@ bool Qwen3Model::prefill_step(int token_id, int pos) {
 float* Qwen3Model::forward(int token_id, int pos) {
     if (!forward_layers(token_id, pos)) return nullptr;
 
+    // Skip LM head during prefill_step
+    if (skip_lm_head_) { skip_lm_head_ = false; return logits_; }
+
     // ============ PATCH 4: Parallel LM head chunks via dispatch_apply ============
     if (ane_lm_head_enabled_ && !lm_head_kernels_.empty()) {
         int chunks = (int)lm_head_kernels_.size();
@@ -375,6 +378,11 @@ float* Qwen3Model::forward(int token_id, int pos) {
         matvec(logits_, lm_head_, x_, vocab_size_, hidden_size_);
     }
     return logits_;
+}
+
+bool Qwen3Model::prefill_step(int token_id, int pos) {
+    skip_lm_head_ = true;
+    return forward(token_id, pos) != nullptr;
 }
 
 } // namespace ane_lm
