@@ -108,7 +108,7 @@ static int cmd_generate(LLMModel& model, Tokenizer& tokenizer, const Args& args)
 
 static int cmd_chat(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
     std::vector<std::pair<std::string, std::string>> messages;
-    std::vector<int> prev_all_tokens;  // KV cache token history (prefill + generated)
+    int kv_pos = 0;  // current position in KV cache (tokens already processed)
     char buf[4096];
 
     while (true) {
@@ -125,30 +125,9 @@ static int cmd_chat(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
 
         messages.push_back({"user", std::string(buf)});
 
-        // Tokenize full conversation
-        std::string formatted = tokenizer.has_chat_template()
-            ? tokenizer.apply_chat_template(messages, true, args.enable_thinking)
-            : "";  // fallback handled in stream_generate
-        std::vector<int> new_prompt = formatted.empty()
-            ? std::vector<int>()
-            : tokenizer.encode(formatted);
-
-        // Compute longest common prefix with previous KV cache content
-        int lcp = 0;
-        if (!new_prompt.empty() && !prev_all_tokens.empty()) {
-            int max_lcp = std::min((int)new_prompt.size(), (int)prev_all_tokens.size());
-            while (lcp < max_lcp && new_prompt[lcp] == prev_all_tokens[lcp]) lcp++;
-        }
-
-        if (lcp < (int)prev_all_tokens.size()) {
-            // KV cache diverges at position lcp — must reset
-            model.reset();
-            lcp = 0;
-            LOG("KV cache reset (mismatch at pos %d)\n", lcp);
-        } else {
-            LOG("KV cache reuse: %d/%d tokens cached, prefilling %d new\n",
-                lcp, (int)new_prompt.size(), (int)new_prompt.size() - lcp);
-        }
+        // KV cache position-based reuse: skip first kv_pos tokens (already in cache)
+        // Safe for BPE tokenizers where template formatting is additive (prefix-stable)
+        int cache_len = kv_pos;  // tokens already in KV cache from previous turns
 
         SamplingParams sampling;
         sampling.temperature = args.temperature;
@@ -157,7 +136,6 @@ static int cmd_chat(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
         std::string assistant_text;
         GenerationResponse last{};
         std::vector<int> all_tokens;
-
         stream_generate(model, tokenizer, messages,
             args.max_tokens, args.enable_thinking, sampling,
             [&](const GenerationResponse& r) {
@@ -168,15 +146,17 @@ static int cmd_chat(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
                 }
                 last = r;
             },
-            lcp,          // prompt_cache_len: skip already-cached tokens
+            cache_len,    // prompt_cache_len: skip already-cached tokens
             &all_tokens   // output: full token sequence for next turn
         );
 
         fprintf(stderr, "\n");
         messages.push_back({"assistant", assistant_text});
-        prev_all_tokens = std::move(all_tokens);
 
-        int cached = lcp, total_prompt = last.prompt_tokens;
+        // Update KV cache position: prompt tokens + generated tokens
+        kv_pos = (int)all_tokens.size();
+
+        int cached = cache_len, total_prompt = last.prompt_tokens;
         int new_prefill = total_prompt - cached;
         fprintf(stderr, "[%d prompt (%d cached, %d new), %.1f t/s | %d gen, %.1f t/s]\n\n",
                 total_prompt, cached, new_prefill > 0 ? new_prefill : 0, last.prompt_tps,
