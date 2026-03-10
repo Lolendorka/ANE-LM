@@ -108,7 +108,6 @@ static int cmd_generate(LLMModel& model, Tokenizer& tokenizer, const Args& args)
 
 static int cmd_chat(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
     std::vector<std::pair<std::string, std::string>> messages;
-    int kv_pos = 0;  // current position in KV cache (tokens already processed)
     char buf[4096];
 
     while (true) {
@@ -125,9 +124,8 @@ static int cmd_chat(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
 
         messages.push_back({"user", std::string(buf)});
 
-        // KV cache position-based reuse: skip first kv_pos tokens (already in cache)
-        // Safe for BPE tokenizers where template formatting is additive (prefix-stable)
-        int cache_len = kv_pos;  // tokens already in KV cache from previous turns
+        // Reset model state for correct context
+        model.reset();
 
         SamplingParams sampling;
         sampling.temperature = args.temperature;
@@ -135,7 +133,6 @@ static int cmd_chat(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
 
         std::string assistant_text;
         GenerationResponse last{};
-        std::vector<int> all_tokens;
         stream_generate(model, tokenizer, messages,
             args.max_tokens, args.enable_thinking, sampling,
             [&](const GenerationResponse& r) {
@@ -145,21 +142,13 @@ static int cmd_chat(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
                     assistant_text += r.text;
                 }
                 last = r;
-            },
-            cache_len,    // prompt_cache_len: skip already-cached tokens
-            &all_tokens   // output: full token sequence for next turn
-        );
+            });
 
         fprintf(stderr, "\n");
         messages.push_back({"assistant", assistant_text});
 
-        // Update KV cache position: prompt tokens + generated tokens
-        kv_pos = (int)all_tokens.size();
-
-        int cached = cache_len, total_prompt = last.prompt_tokens;
-        int new_prefill = total_prompt - cached;
-        fprintf(stderr, "[%d prompt (%d cached, %d new), %.1f t/s | %d gen, %.1f t/s]\n\n",
-                total_prompt, cached, new_prefill > 0 ? new_prefill : 0, last.prompt_tps,
+        fprintf(stderr, "[%d prompt, %.1f t/s | %d gen, %.1f t/s]\n\n",
+                last.prompt_tokens, last.prompt_tps,
                 last.generation_tokens, last.generation_tps);
     }
 
