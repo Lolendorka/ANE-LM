@@ -29,11 +29,11 @@ public:
     ~Qwen3Model() override;
     bool load(const std::string& model_dir) override;
     float* forward(int token_id, int pos) override;
+    bool prefill_step(int token_id, int pos) override;  // efficient: skips LM head
     void reset() override;
     int vocab_size() const override { return vocab_size_; }
 
 private:
-    // Config
     int hidden_size_ = 0;
     int intermediate_size_ = 0;
     int vocab_size_ = 0;
@@ -97,6 +97,7 @@ private:
     bool compile_lm_head_ane(ModelWeights* sf, const std::string& blob_dir);
     void free_lm_head_ane();
 
+    bool forward_layers(int token_id, int pos);  // shared: embedding + all layers + final norm
     bool forward_full_attn_core(int L, float* x, float* pre_oproj, int pos);
 };
 
