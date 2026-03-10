@@ -27,13 +27,11 @@ kernel void matvec_f16(
     device const half* row = W + tid * in_dim;
     float sum = 0.0f;
     uint j = 0;
-    // Vectorized: process 8 elements per iteration
-    for (; j + 7 < in_dim; j += 8) {
-        half8 w8 = *((device const half8*)(row + j));
-        sum += float(w8[0]) * x[j]   + float(w8[1]) * x[j+1]
-             + float(w8[2]) * x[j+2] + float(w8[3]) * x[j+3]
-             + float(w8[4]) * x[j+4] + float(w8[5]) * x[j+5]
-             + float(w8[6]) * x[j+6] + float(w8[7]) * x[j+7];
+    // Vectorized: process 4 elements per iteration using half4
+    for (; j + 3 < in_dim; j += 4) {
+        half4 w4 = *((device const half4*)(row + j));
+        sum += float(w4[0]) * x[j]   + float(w4[1]) * x[j+1]
+             + float(w4[2]) * x[j+2] + float(w4[3]) * x[j+3];
     }
     for (; j < in_dim; j++) sum += float(row[j]) * x[j];
     y[tid] = sum;
@@ -53,17 +51,13 @@ kernel void fused_gate_up_silu(
     device const half* u_row = W_up   + tid * in_dim;
     float g = 0.0f, u = 0.0f;
     uint j = 0;
-    for (; j + 7 < in_dim; j += 8) {
-        half8 gw = *((device const half8*)(g_row + j));
-        half8 uw = *((device const half8*)(u_row + j));
+    for (; j + 3 < in_dim; j += 4) {
+        half4 gw = *((device const half4*)(g_row + j));
+        half4 uw = *((device const half4*)(u_row + j));
         g += float(gw[0])*x[j]   + float(gw[1])*x[j+1]
-           + float(gw[2])*x[j+2] + float(gw[3])*x[j+3]
-           + float(gw[4])*x[j+4] + float(gw[5])*x[j+5]
-           + float(gw[6])*x[j+6] + float(gw[7])*x[j+7];
+           + float(gw[2])*x[j+2] + float(gw[3])*x[j+3];
         u += float(uw[0])*x[j]   + float(uw[1])*x[j+1]
-           + float(uw[2])*x[j+2] + float(uw[3])*x[j+3]
-           + float(uw[4])*x[j+4] + float(uw[5])*x[j+5]
-           + float(uw[6])*x[j+6] + float(uw[7])*x[j+7];
+           + float(uw[2])*x[j+2] + float(uw[3])*x[j+3];
     }
     for (; j < in_dim; j++) {
         g += float(g_row[j]) * x[j];
@@ -193,7 +187,7 @@ bool metal_init() {
         NSError* error = nil;
         NSString* source = [NSString stringWithUTF8String:g_shader_source];
         MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
-        opts.fastMathEnabled = YES;
+        opts.mathMode = MTLMathModeFast;
 
         id<MTLLibrary> lib = [g_device newLibraryWithSource:source options:opts error:&error];
         if (!lib) {
