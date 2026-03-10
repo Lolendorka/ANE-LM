@@ -33,7 +33,9 @@ void stream_generate(
     int max_tokens,
     bool enable_thinking,
     const SamplingParams& sampling,
-    std::function<void(const GenerationResponse&)> callback)
+    std::function<void(const GenerationResponse&)> callback,
+    int prompt_cache_len,
+    std::vector<int>* out_all_tokens)
 {
     std::vector<int> prompt_tokens;
     if (tokenizer.has_chat_template()) {
@@ -45,18 +47,26 @@ void stream_generate(
         prompt_tokens = tokenizer.encode(combined);
     }
 
-    // PERF: skip LM head for intermediate prefill tokens (~10 dispatches saved/token)
+    // PERF: skip already-cached tokens + skip LM head for intermediate prefill tokens
     Timer prefill_timer;
     float* logits = nullptr;
+    int prefill_start = prompt_cache_len;  // skip tokens already in KV cache
     if (!prompt_tokens.empty()) {
-        for (int i = 0; i < (int)prompt_tokens.size() - 1; i++) {
+        // Prefill non-cached intermediate tokens (skip LM head)
+        for (int i = prefill_start; i < (int)prompt_tokens.size() - 1; i++) {
             if (!model.prefill_step(prompt_tokens[i], i)) {
                 fprintf(stderr, "Prefill failed at token index %d\n", i);
                 return;
             }
         }
+        // Last token: full forward with LM head
         int last = (int)prompt_tokens.size() - 1;
-        logits = model.forward(prompt_tokens[last], last);
+        if (last >= prefill_start) {
+            logits = model.forward(prompt_tokens[last], last);
+        } else {
+            // All tokens were cached, re-run last cached token to get logits
+            logits = model.forward(prompt_tokens[last], last);
+        }
         if (!logits) {
             fprintf(stderr, "Forward failed at last prefill token\n");
             return;
@@ -153,6 +163,13 @@ void stream_generate(
         }
     }
 
+    // Output all token IDs (prompt + generated) for KV cache tracking
+    if (out_all_tokens) {
+        out_all_tokens->clear();
+        out_all_tokens->insert(out_all_tokens->end(), prompt_tokens.begin(), prompt_tokens.end());
+        out_all_tokens->insert(out_all_tokens->end(), generated_tokens.begin(), generated_tokens.end());
+    }
+
     // Final stats callback (token = -1 signals end)
     if (callback) {
         GenerationResponse r;
@@ -172,10 +189,12 @@ void stream_generate(
     int max_tokens,
     bool enable_thinking,
     const SamplingParams& sampling,
-    std::function<void(const GenerationResponse&)> callback)
+    std::function<void(const GenerationResponse&)> callback,
+    int prompt_cache_len,
+    std::vector<int>* out_all_tokens)
 {
     std::vector<std::pair<std::string, std::string>> messages = {{"user", prompt}};
-    stream_generate(model, tokenizer, messages, max_tokens, enable_thinking, sampling, std::move(callback));
+    stream_generate(model, tokenizer, messages, max_tokens, enable_thinking, sampling, std::move(callback), prompt_cache_len, out_all_tokens);
 }
 
 } // namespace ane_lm

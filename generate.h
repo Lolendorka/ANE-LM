@@ -27,7 +27,9 @@ void stream_generate(
     int max_tokens = 0,
     bool enable_thinking = false,
     const SamplingParams& sampling = {},
-    std::function<void(const GenerationResponse&)> callback = nullptr);
+    std::function<void(const GenerationResponse&)> callback = nullptr,
+    int prompt_cache_len = 0,  // skip first N tokens (already in KV cache)
+    std::vector<int>* out_all_tokens = nullptr);  // output: all processed token IDs
 
 // Single-prompt convenience overload
 void stream_generate(
@@ -37,6 +39,8 @@ void stream_generate(
     int max_tokens = 0,
     bool enable_thinking = false,
     const SamplingParams& sampling = {},
-    std::function<void(const GenerationResponse&)> callback = nullptr);
+    std::function<void(const GenerationResponse&)> callback = nullptr,
+    int prompt_cache_len = 0,
+    std::vector<int>* out_all_tokens = nullptr);
 
 } // namespace ane_lm
