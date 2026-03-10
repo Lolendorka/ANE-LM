@@ -425,50 +425,15 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         }
     }
 
-    // Create Metal GPU weight buffers (for --use-metal mode)
-    if (metal_available()) {
-        for (int L = 0; L < num_layers_; L++) {
-            char mn[256], mn2[256], mn3[256];
-            // O projection
-            if (layer_types_[L] == LayerType::LinearAttention) {
-                snprintf(mn, sizeof(mn), "model.language_model.layers.%d.linear_attn.out_proj.weight", L);
-            } else {
-                snprintf(mn, sizeof(mn), "model.language_model.layers.%d.self_attn.o_proj.weight", L);
-            }
-            const uint16_t* o_bf16 = sf->get_bf16_ptr(mn);
-            int o_out = hidden_size_;
-            int o_in = (layer_types_[L] == LayerType::LinearAttention) ? lin_total_val_ : full_out_dim_;
-            if (o_bf16) {
-                uint16_t* o_fp16 = (uint16_t*)malloc((size_t)o_out * o_in * sizeof(uint16_t));
-                bf16_to_f16_vec(o_fp16, o_bf16, o_out * o_in);
-                metal_layers_[L].o_proj = metal_create_weight(o_fp16, o_out, o_in);
-            }
-            // FFN weights
-            snprintf(mn, sizeof(mn), "model.language_model.layers.%d.mlp.gate_proj.weight", L);
-            snprintf(mn2, sizeof(mn2), "model.language_model.layers.%d.mlp.up_proj.weight", L);
-            snprintf(mn3, sizeof(mn3), "model.language_model.layers.%d.mlp.down_proj.weight", L);
-            const uint16_t* g16 = sf->get_bf16_ptr(mn);
-            const uint16_t* u16 = sf->get_bf16_ptr(mn2);
-            const uint16_t* d16 = sf->get_bf16_ptr(mn3);
-            if (g16 && u16 && d16) {
-                uint16_t* gf = (uint16_t*)malloc((size_t)intermediate_size_ * hidden_size_ * 2);
-                uint16_t* uf = (uint16_t*)malloc((size_t)intermediate_size_ * hidden_size_ * 2);
-                uint16_t* df = (uint16_t*)malloc((size_t)hidden_size_ * intermediate_size_ * 2);
-                bf16_to_f16_vec(gf, g16, intermediate_size_ * hidden_size_);
-                bf16_to_f16_vec(uf, u16, intermediate_size_ * hidden_size_);
-                bf16_to_f16_vec(df, d16, hidden_size_ * intermediate_size_);
-                metal_layers_[L].gate_proj = metal_create_weight(gf, intermediate_size_, hidden_size_);
-                metal_layers_[L].up_proj = metal_create_weight(uf, intermediate_size_, hidden_size_);
-                metal_layers_[L].down_proj = metal_create_weight(df, hidden_size_, intermediate_size_);
-            }
-        }
-        LOG("  Metal GPU weights created for %d layers\n", num_layers_);
-    }
-
-    int compiled = ane_compile_count();
+        int compiled = ane_compile_count();
     int cached = ane_cache_loads();
     LOG("  %d ANE layer kernels ready (compiled=%d, cached=%d)\n",
         compiled + cached, compiled, cached);
+
+    // Pre-compile Metal weights (available for --use-metal mode)
+    if (metal_available()) {
+        compile_metal_weights(sf);
+    }
 
     if (!compile_lm_head_ane(sf, blob_dir)) {
         LOG("ANE LM head disabled, falling back to CPU\n");
@@ -530,6 +495,46 @@ bool Qwen35Model::compile_lm_head_ane(ModelWeights* sf, const std::string& blob_
     ane_lm_head_enabled_ = true;
     lm_head_chunk_ = chunk;
     return true;
+}
+
+void Qwen35Model::compile_metal_weights(ModelWeights* sf) {
+    if (!metal_available()) return;
+    for (int L = 0; L < num_layers_; L++) {
+        char mn[256], mn2[256], mn3[256];
+        // O projection
+        if (layer_types_[L] == LayerType::LinearAttention) {
+            snprintf(mn, sizeof(mn), "model.language_model.layers.%d.linear_attn.out_proj.weight", L);
+        } else {
+            snprintf(mn, sizeof(mn), "model.language_model.layers.%d.self_attn.o_proj.weight", L);
+        }
+        const uint16_t* o_bf16 = sf ? sf->get_bf16_ptr(mn) : nullptr;
+        int o_out = hidden_size_;
+        int o_in = (layer_types_[L] == LayerType::LinearAttention) ? lin_total_val_ : full_out_dim_;
+        if (o_bf16) {
+            uint16_t* fp16 = (uint16_t*)malloc((size_t)o_out * o_in * 2);
+            bf16_to_f16_vec(fp16, o_bf16, o_out * o_in);
+            metal_layers_[L].o_proj = metal_create_weight(fp16, o_out, o_in);
+        }
+        // FFN
+        snprintf(mn, sizeof(mn), "model.language_model.layers.%d.mlp.gate_proj.weight", L);
+        snprintf(mn2, sizeof(mn2), "model.language_model.layers.%d.mlp.up_proj.weight", L);
+        snprintf(mn3, sizeof(mn3), "model.language_model.layers.%d.mlp.down_proj.weight", L);
+        const uint16_t* g = sf ? sf->get_bf16_ptr(mn) : nullptr;
+        const uint16_t* u = sf ? sf->get_bf16_ptr(mn2) : nullptr;
+        const uint16_t* d = sf ? sf->get_bf16_ptr(mn3) : nullptr;
+        if (g && u && d) {
+            uint16_t* gf = (uint16_t*)malloc((size_t)intermediate_size_ * hidden_size_ * 2);
+            uint16_t* uf = (uint16_t*)malloc((size_t)intermediate_size_ * hidden_size_ * 2);
+            uint16_t* df = (uint16_t*)malloc((size_t)hidden_size_ * intermediate_size_ * 2);
+            bf16_to_f16_vec(gf, g, intermediate_size_ * hidden_size_);
+            bf16_to_f16_vec(uf, u, intermediate_size_ * hidden_size_);
+            bf16_to_f16_vec(df, d, hidden_size_ * intermediate_size_);
+            metal_layers_[L].gate_proj = metal_create_weight(gf, intermediate_size_, hidden_size_);
+            metal_layers_[L].up_proj = metal_create_weight(uf, intermediate_size_, hidden_size_);
+            metal_layers_[L].down_proj = metal_create_weight(df, hidden_size_, intermediate_size_);
+        }
+    }
+    LOG("  Metal GPU weights created for %d layers\n", num_layers_);
 }
 
 void Qwen35Model::free_lm_head_ane() {
@@ -807,6 +812,15 @@ float* Qwen35Model::forward(int token, int pos) {
     }
 
     return logits_;
+}
+
+void Qwen35Model::set_use_metal(bool v) {
+    use_metal_matmul_ = v;
+    if (v && metal_layers_.empty()) {
+        // Need to initialize Metal weight buffers - but ModelWeights is gone
+        // The weights will be compiled lazily if sf is available during load
+        LOG("Metal mode enabled (weights will be compiled if available)\n");
+    }
 }
 
 bool Qwen35Model::prefill_step(int token_id, int pos) {

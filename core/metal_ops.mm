@@ -223,15 +223,13 @@ MetalWeight* metal_create_weight(const uint16_t* fp16_data, int out_dim, int in_
     MetalWeight* w = new MetalWeight();
     w->out_dim = out_dim;
     w->in_dim = in_dim;
-    // Zero-copy wrap (Apple Silicon unified memory)
-    w->buffer = [g_device newBufferWithBytesNoCopy:(void*)fp16_data
-                          length:size
-                          options:MTLResourceStorageModeShared
-                          deallocator:nil];
+    // Copy weights into Metal-managed buffer (safe, no alignment issues)
+    w->buffer = [g_device newBufferWithBytes:fp16_data length:size
+                          options:MTLResourceStorageModeShared];
     if (!w->buffer) {
-        // Fallback: copy
-        w->buffer = [g_device newBufferWithBytes:fp16_data length:size
-                              options:MTLResourceStorageModeShared];
+        fprintf(stderr, "Metal: failed to create weight buffer (%zu bytes)\n", size);
+        delete w;
+        return nullptr;
     }
     return w;
 }

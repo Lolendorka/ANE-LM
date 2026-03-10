@@ -69,7 +69,8 @@ public:
     ~Qwen35Model() override;
     bool load(const std::string& model_dir) override;
     float* forward(int token_id, int pos) override;
-    void set_use_metal(bool v) override { use_metal_matmul_ = v; }
+    void set_use_metal(bool v) override;
+    void compile_metal_weights(ModelWeights* sf);
     bool prefill_step(int token_id, int pos) override;  // skips LM head
     void reset() override;
     int vocab_size() const override { return vocab_size_; }
