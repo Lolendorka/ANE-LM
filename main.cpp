@@ -254,6 +254,7 @@ int main(int argc, char* argv[]) {
 
     // Enable Metal matmul if requested
     if (args.use_metal && metal_available()) {
+        model->set_use_metal(true);
         LOG("Using Metal GPU for matmuls\n");
     }
 

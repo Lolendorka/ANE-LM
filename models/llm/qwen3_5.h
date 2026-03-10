@@ -25,6 +25,7 @@ public:
     virtual int vocab_size() const = 0;
     // prefill_step: runs transformer without LM head (saves ~10 ANE dispatches)
     // Base impl calls forward() and discards result (correct but not optimized)
+    virtual void set_use_metal(bool v) {}  // override in subclasses
     virtual bool prefill_step(int token_id, int pos) {
         return forward(token_id, pos) != nullptr;
     }
@@ -68,6 +69,7 @@ public:
     ~Qwen35Model() override;
     bool load(const std::string& model_dir) override;
     float* forward(int token_id, int pos) override;
+    void set_use_metal(bool v) override { use_metal_matmul_ = v; }
     bool prefill_step(int token_id, int pos) override;  // skips LM head
     void reset() override;
     int vocab_size() const override { return vocab_size_; }

@@ -425,6 +425,46 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         }
     }
 
+    // Create Metal GPU weight buffers (for --use-metal mode)
+    if (metal_available()) {
+        for (int L = 0; L < num_layers_; L++) {
+            char mn[256], mn2[256], mn3[256];
+            // O projection
+            if (layer_types_[L] == LayerType::LinearAttention) {
+                snprintf(mn, sizeof(mn), "model.language_model.layers.%d.linear_attn.out_proj.weight", L);
+            } else {
+                snprintf(mn, sizeof(mn), "model.language_model.layers.%d.self_attn.o_proj.weight", L);
+            }
+            const uint16_t* o_bf16 = sf->get_bf16_ptr(mn);
+            int o_out = hidden_size_;
+            int o_in = (layer_types_[L] == LayerType::LinearAttention) ? lin_total_val_ : full_out_dim_;
+            if (o_bf16) {
+                uint16_t* o_fp16 = (uint16_t*)malloc((size_t)o_out * o_in * sizeof(uint16_t));
+                bf16_to_f16_vec(o_fp16, o_bf16, o_out * o_in);
+                metal_layers_[L].o_proj = metal_create_weight(o_fp16, o_out, o_in);
+            }
+            // FFN weights
+            snprintf(mn, sizeof(mn), "model.language_model.layers.%d.mlp.gate_proj.weight", L);
+            snprintf(mn2, sizeof(mn2), "model.language_model.layers.%d.mlp.up_proj.weight", L);
+            snprintf(mn3, sizeof(mn3), "model.language_model.layers.%d.mlp.down_proj.weight", L);
+            const uint16_t* g16 = sf->get_bf16_ptr(mn);
+            const uint16_t* u16 = sf->get_bf16_ptr(mn2);
+            const uint16_t* d16 = sf->get_bf16_ptr(mn3);
+            if (g16 && u16 && d16) {
+                uint16_t* gf = (uint16_t*)malloc((size_t)intermediate_size_ * hidden_size_ * 2);
+                uint16_t* uf = (uint16_t*)malloc((size_t)intermediate_size_ * hidden_size_ * 2);
+                uint16_t* df = (uint16_t*)malloc((size_t)hidden_size_ * intermediate_size_ * 2);
+                bf16_to_f16_vec(gf, g16, intermediate_size_ * hidden_size_);
+                bf16_to_f16_vec(uf, u16, intermediate_size_ * hidden_size_);
+                bf16_to_f16_vec(df, d16, hidden_size_ * intermediate_size_);
+                metal_layers_[L].gate_proj = metal_create_weight(gf, intermediate_size_, hidden_size_);
+                metal_layers_[L].up_proj = metal_create_weight(uf, intermediate_size_, hidden_size_);
+                metal_layers_[L].down_proj = metal_create_weight(df, hidden_size_, intermediate_size_);
+            }
+        }
+        LOG("  Metal GPU weights created for %d layers\n", num_layers_);
+    }
+
     int compiled = ane_compile_count();
     int cached = ane_cache_loads();
     LOG("  %d ANE layer kernels ready (compiled=%d, cached=%d)\n",
@@ -705,7 +745,9 @@ float* Qwen35Model::forward(int token, int pos) {
 
         int attn_dim = (layer_types_[L] == LayerType::LinearAttention) ? lin_total_val_ : full_out_dim_;
         float* attn_out = x_norm_;
-        if (!ane_matvec(ane_layers_[L].o_proj, attn_out, pre_oproj, attn_dim, hidden_size_)) {
+        if (use_metal_matmul_ && metal_layers_[L].o_proj) {
+            metal_matvec(metal_layers_[L].o_proj, attn_out, pre_oproj);
+        } else if (!ane_matvec(ane_layers_[L].o_proj, attn_out, pre_oproj, attn_dim, hidden_size_)) {
             fprintf(stderr, "ANE o_proj eval failed at layer %d\n", L);
             return nullptr;
         }
@@ -716,7 +758,11 @@ float* Qwen35Model::forward(int token, int pos) {
         rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
 
         float* mlp_out = scratch_attn_;
-        if (!ane_matvec(ane_layers_[L].fused_ffn, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
+        if (use_metal_matmul_ && metal_layers_[L].gate_proj) {
+            metal_fused_ffn(metal_layers_[L].gate_proj, metal_layers_[L].up_proj,
+                           metal_layers_[L].down_proj, mlp_out, x_norm_,
+                           hidden_size_, intermediate_size_, hidden_size_);
+        } else if (!ane_matvec(ane_layers_[L].fused_ffn, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
             fprintf(stderr, "ANE fused_ffn eval failed at layer %d\n", L);
             return nullptr;
         }
