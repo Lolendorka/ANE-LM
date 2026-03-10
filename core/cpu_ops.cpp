@@ -1,6 +1,7 @@
 #include "cpu_ops.h"
 #include <alloca.h>
 #include <dispatch/dispatch.h>
+#include <arm_neon.h>
 
 namespace ane_lm {
 
@@ -38,40 +39,59 @@ void rmsnorm_gated(float* out, const float* x, const float* z,
     vDSP_vmul(out, 1, z, 1, out, 1, (vDSP_Length)dim);
 }
 
-// ============ PATCH 5: vDSP-vectorized RoPE per-head rotation ============
-// Replaces scalar pairwise rotation loop with SIMD vDSP_vmmsb + vDSP_vmma
-static void apply_rope_head_vdsp(float* v, const float* cos_row,
-                                  const float* sin_row, int half) {
-    // Allocate temp buffer for the lower half (overwritten in-place)
-    float* tmp = (float*)alloca(half * sizeof(float));
-    vDSP_Length n = (vDSP_Length)half;
-    // tmp = v[0..half] * cos - v[half..] * sin
-    vDSP_vmmsb(v, 1, cos_row, 1, v + half, 1, sin_row, 1, tmp, 1, n);
-    // v[half..] = v[half..] * cos + v[0..half] * sin  (before overwriting v[0..half])
-    vDSP_vmma(v + half, 1, cos_row, 1, v, 1, sin_row, 1, v + half, 1, n);
-    // v[0..half] = tmp
-    memcpy(v, tmp, half * sizeof(float));
+// ============ BUGFIX + PERF: NEON alternating-pairs RoPE ============
+// Correct implementation for (v[2j], v[2j+1]) rotation using vld2/vst2.
+// vld2q_f32 de-interleaves: .val[0] = even elements, .val[1] = odd elements.
+// This lets us apply cos/sin to all pairs simultaneously with SIMD.
+static void apply_rope_neon_pairs(float* v, const float* cos_row,
+                                   const float* sin_row, int rot_dim) {
+    int half = rot_dim / 2;  // number of pairs
+    int j = 0;
+
+    // Process 4 pairs (8 floats) at a time
+    for (; j + 3 < half; j += 4) {
+        // Load 8 floats de-interleaved: val[0]=even, val[1]=odd
+        float32x4x2_t vp = vld2q_f32(&v[j * 2]);
+        float32x4_t cos4 = vld1q_f32(&cos_row[j]);
+        float32x4_t sin4 = vld1q_f32(&sin_row[j]);
+
+        // new_even = even * cos - odd * sin
+        float32x4_t new_even = vmlsq_f32(vmulq_f32(vp.val[0], cos4), vp.val[1], sin4);
+        // new_odd  = even * sin + odd * cos
+        float32x4_t new_odd  = vmlaq_f32(vmulq_f32(vp.val[0], sin4), vp.val[1], cos4);
+
+        float32x4x2_t result = {new_even, new_odd};
+        vst2q_f32(&v[j * 2], result);  // re-interleave and store
+    }
+
+    // Scalar tail for remaining pairs
+    for (; j < half; j++) {
+        float v0 = v[j * 2];
+        float v1 = v[j * 2 + 1];
+        v[j * 2]     = v0 * cos_row[j] - v1 * sin_row[j];
+        v[j * 2 + 1] = v0 * sin_row[j] + v1 * cos_row[j];
+    }
 }
 
 void apply_rope_cached(float* q, float* k, int n_q_heads, int n_kv_heads,
                        int head_dim, int q_head_stride, int k_head_stride,
                        int rot_dim, int pos, float theta,
                        const float* cos_row, const float* sin_row) {
-    int half = rot_dim / 2;
-    for (int h = 0; h < n_q_heads + n_kv_heads; h++) {
-        float* v = (h < n_q_heads) ? q + h * q_head_stride : k + (h - n_q_heads) * k_head_stride;
-        if (cos_row && sin_row) {
-            // Fast path: use precomputed trig tables + vDSP SIMD
-            apply_rope_head_vdsp(v, cos_row, sin_row, half);
-        } else {
-            // Fallback: compute on-the-fly (should not happen with rope_cache)
-            for (int i = 0, j = 0; i < rot_dim; i += 2, j++) {
+    if (cos_row && sin_row) {
+        // Fast NEON path: correct alternating-pairs rotation with vld2/vst2
+        for (int h = 0; h < n_q_heads + n_kv_heads; h++) {
+            float* v = (h < n_q_heads) ? q + h * q_head_stride : k + (h - n_q_heads) * k_head_stride;
+            apply_rope_neon_pairs(v, cos_row, sin_row, rot_dim);
+        }
+    } else {
+        // Fallback: compute trig on-the-fly (should not happen with rope_cache)
+        for (int h = 0; h < n_q_heads + n_kv_heads; h++) {
+            float* v = (h < n_q_heads) ? q + h * q_head_stride : k + (h - n_q_heads) * k_head_stride;
+            for (int i = 0, j2 = 0; i < rot_dim; i += 2, j2++) {
                 float freq = 1.0f / powf(theta, (float)i / (float)rot_dim);
                 float angle = pos * freq;
-                float cos_a = cosf(angle);
-                float sin_a = sinf(angle);
-                float v0 = v[i];
-                float v1 = v[i + 1];
+                float cos_a = cosf(angle), sin_a = sinf(angle);
+                float v0 = v[i], v1 = v[i + 1];
                 v[i]     = v0 * cos_a - v1 * sin_a;
                 v[i + 1] = v0 * sin_a + v1 * cos_a;
             }
@@ -81,19 +101,14 @@ void apply_rope_cached(float* q, float* k, int n_q_heads, int n_kv_heads,
 
 // ============ PATCH 3: Vectorized softmax via vvexpf ============
 void softmax(float* x, int n) {
-    // 1. Find max via SIMD (stable softmax)
     float max_val;
     vDSP_maxv(x, 1, &max_val, (vDSP_Length)n);
-    // 2. Subtract max in-place
     float neg_max = -max_val;
     vDSP_vsadd(x, 1, &neg_max, x, 1, (vDSP_Length)n);
-    // 3. NEON-vectorized batch exp (10-20x faster than scalar expf loop)
     int vn = n;
     vvexpf(x, x, &vn);
-    // 4. Sum
     float sum;
     vDSP_sve(x, 1, &sum, (vDSP_Length)n);
-    // 5. Normalize
     float inv = 1.0f / sum;
     vDSP_vsmul(x, 1, &inv, x, 1, (vDSP_Length)n);
 }
@@ -117,19 +132,16 @@ void conv1d_update(float* y, float* conv_state, int* state_pos, const float* x,
 
     if (kernel_size == 4) {
         int p0 = pos;
-        int p1 = (pos + 1);
-        if (p1 == 3) p1 = 0;
-        int p2 = (p1 + 1);
-        if (p2 == 3) p2 = 0;
+        int p1 = (pos + 1); if (p1 == 3) p1 = 0;
+        int p2 = (p1 + 1);  if (p2 == 3) p2 = 0;
 
         for (int c = 0; c < channels; c++) {
-            const int sbase = c * 3;
-            const int wbase = c * 4;
+            const int sbase = c * 3, wbase = c * 4;
             float s0 = conv_state[sbase + p0];
             float s1 = conv_state[sbase + p1];
             float s2 = conv_state[sbase + p2];
             float xc = x[c];
-            y[c] = s0 * w[wbase] + s1 * w[wbase + 1] + s2 * w[wbase + 2] + xc * w[wbase + 3];
+            y[c] = s0 * w[wbase] + s1 * w[wbase+1] + s2 * w[wbase+2] + xc * w[wbase+3];
             conv_state[sbase + p0] = xc;
         }
     } else {
@@ -146,7 +158,6 @@ void conv1d_update(float* y, float* conv_state, int* state_pos, const float* x,
             conv_state[base + pos] = xc;
         }
     }
-
     pos++;
     if (pos == state_len) pos = 0;
     *state_pos = pos;
@@ -157,14 +168,11 @@ void ssm_step(float* y, float* state, const float* q, const float* k,
     float* Sk = (float*)alloca(value_dim * sizeof(float));
     cblas_sgemv(CblasRowMajor, CblasTrans, key_dim, value_dim, 1.0f,
                 state, value_dim, k, 1, 0.0f, Sk, 1);
-
     float* delta = (float*)alloca(value_dim * sizeof(float));
     vDSP_vsub(Sk, 1, v, 1, delta, 1, (vDSP_Length)value_dim);
-
     cblas_sscal(key_dim * value_dim, decay, state, 1);
     cblas_sger(CblasRowMajor, key_dim, value_dim, beta,
                k, 1, delta, 1, state, value_dim);
-
     cblas_sgemv(CblasRowMajor, CblasTrans, key_dim, value_dim, 1.0f,
                 state, value_dim, q, 1, 0.0f, y, 1);
 }
@@ -187,10 +195,8 @@ void gqa_attention(float* out, const float* q,
     if (first_span > cache_len) first_span = cache_len;
     int second_span = cache_len - first_span;
 
-    // Per-head score buffers on heap (avoids stack overflow for large cache_len*n_heads)
     float* scores_buf = (float*)malloc((size_t)n_heads * cache_len * sizeof(float));
 
-    // Per-head computation lambda — each head writes to disjoint out[h*head_dim]
     auto head_fn = [&](int h) {
         int kv_h = h / groups;
         const float* qh = q + (size_t)h * q_head_stride;
@@ -213,7 +219,6 @@ void gqa_attention(float* out, const float* q,
         }
 
         softmax(scores, cache_len);
-
         memset(oh, 0, head_dim * sizeof(float));
         t = 0;
         for (int s = 0; s < first_span; s++, t++) {
@@ -226,8 +231,6 @@ void gqa_attention(float* out, const float* q,
         }
     };
 
-    // Parallel for ctx >= 128: all heads are independent (disjoint writes to out)
-    // Sequential for short ctx to avoid dispatch_apply overhead
     if (cache_len >= 128 && n_heads >= 4) {
         dispatch_apply(n_heads,
             dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
