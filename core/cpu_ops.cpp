@@ -1,5 +1,6 @@
 #include "cpu_ops.h"
 #include <alloca.h>
+#include <dispatch/dispatch.h>
 
 namespace ane_lm {
 
@@ -37,39 +38,62 @@ void rmsnorm_gated(float* out, const float* x, const float* z,
     vDSP_vmul(out, 1, z, 1, out, 1, (vDSP_Length)dim);
 }
 
+// ============ PATCH 5: vDSP-vectorized RoPE per-head rotation ============
+// Replaces scalar pairwise rotation loop with SIMD vDSP_vmmsb + vDSP_vmma
+static void apply_rope_head_vdsp(float* v, const float* cos_row,
+                                  const float* sin_row, int half) {
+    // Allocate temp buffer for the lower half (overwritten in-place)
+    float* tmp = (float*)alloca(half * sizeof(float));
+    vDSP_Length n = (vDSP_Length)half;
+    // tmp = v[0..half] * cos - v[half..] * sin
+    vDSP_vmmsb(v, 1, cos_row, 1, v + half, 1, sin_row, 1, tmp, 1, n);
+    // v[half..] = v[half..] * cos + v[0..half] * sin  (before overwriting v[0..half])
+    vDSP_vmma(v + half, 1, cos_row, 1, v, 1, sin_row, 1, v + half, 1, n);
+    // v[0..half] = tmp
+    memcpy(v, tmp, half * sizeof(float));
+}
+
 void apply_rope_cached(float* q, float* k, int n_q_heads, int n_kv_heads,
                        int head_dim, int q_head_stride, int k_head_stride,
                        int rot_dim, int pos, float theta,
                        const float* cos_row, const float* sin_row) {
+    int half = rot_dim / 2;
     for (int h = 0; h < n_q_heads + n_kv_heads; h++) {
         float* v = (h < n_q_heads) ? q + h * q_head_stride : k + (h - n_q_heads) * k_head_stride;
-        for (int i = 0, j = 0; i < rot_dim; i += 2, j++) {
-            float cos_a, sin_a;
-            if (cos_row && sin_row) {
-                cos_a = cos_row[j];
-                sin_a = sin_row[j];
-            } else {
+        if (cos_row && sin_row) {
+            // Fast path: use precomputed trig tables + vDSP SIMD
+            apply_rope_head_vdsp(v, cos_row, sin_row, half);
+        } else {
+            // Fallback: compute on-the-fly (should not happen with rope_cache)
+            for (int i = 0, j = 0; i < rot_dim; i += 2, j++) {
                 float freq = 1.0f / powf(theta, (float)i / (float)rot_dim);
                 float angle = pos * freq;
-                cos_a = cosf(angle);
-                sin_a = sinf(angle);
+                float cos_a = cosf(angle);
+                float sin_a = sinf(angle);
+                float v0 = v[i];
+                float v1 = v[i + 1];
+                v[i]     = v0 * cos_a - v1 * sin_a;
+                v[i + 1] = v0 * sin_a + v1 * cos_a;
             }
-            float v0 = v[i];
-            float v1 = v[i + 1];
-            v[i]     = v0 * cos_a - v1 * sin_a;
-            v[i + 1] = v0 * sin_a + v1 * cos_a;
         }
     }
 }
 
+// ============ PATCH 3: Vectorized softmax via vvexpf ============
 void softmax(float* x, int n) {
-    float max_val = x[0];
-    for (int i = 1; i < n; i++) if (x[i] > max_val) max_val = x[i];
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
-    }
+    // 1. Find max via SIMD (stable softmax)
+    float max_val;
+    vDSP_maxv(x, 1, &max_val, (vDSP_Length)n);
+    // 2. Subtract max in-place
+    float neg_max = -max_val;
+    vDSP_vsadd(x, 1, &neg_max, x, 1, (vDSP_Length)n);
+    // 3. NEON-vectorized batch exp (10-20x faster than scalar expf loop)
+    int vn = n;
+    vvexpf(x, x, &vn);
+    // 4. Sum
+    float sum;
+    vDSP_sve(x, 1, &sum, (vDSP_Length)n);
+    // 5. Normalize
     float inv = 1.0f / sum;
     vDSP_vsmul(x, 1, &inv, x, 1, (vDSP_Length)n);
 }
@@ -145,6 +169,7 @@ void ssm_step(float* y, float* state, const float* q, const float* k,
                 state, value_dim, q, 1, 0.0f, y, 1);
 }
 
+// ============ PATCH 8: Parallel GQA attention heads via dispatch_apply ============
 void gqa_attention(float* out, const float* q,
                    const float* k_cache, const float* v_cache,
                    int n_heads, int n_kv_heads, int head_dim, int q_head_stride,
@@ -162,13 +187,16 @@ void gqa_attention(float* out, const float* q,
     if (first_span > cache_len) first_span = cache_len;
     int second_span = cache_len - first_span;
 
-    float* scores = (float*)alloca(cache_len * sizeof(float));
+    // Per-head score buffers on heap (avoids stack overflow for large cache_len*n_heads)
+    float* scores_buf = (float*)malloc((size_t)n_heads * cache_len * sizeof(float));
 
-    for (int h = 0; h < n_heads; h++) {
+    // Per-head computation lambda — each head writes to disjoint out[h*head_dim]
+    auto head_fn = [&](int h) {
         int kv_h = h / groups;
         const float* qh = q + (size_t)h * q_head_stride;
         float* oh = out + h * head_dim;
         size_t kv_head_off = (size_t)kv_h * head_dim;
+        float* scores = scores_buf + (size_t)h * cache_len;
 
         int t = 0;
         for (int s = 0; s < first_span; s++, t++) {
@@ -190,15 +218,25 @@ void gqa_attention(float* out, const float* q,
         t = 0;
         for (int s = 0; s < first_span; s++, t++) {
             const float* vh = v_cache + ((size_t)(cache_start + s) * kv_step + kv_head_off);
-            float sv = scores[t];
-            cblas_saxpy(head_dim, sv, vh, 1, oh, 1);
+            cblas_saxpy(head_dim, scores[t], vh, 1, oh, 1);
         }
         for (int s = 0; s < second_span; s++, t++) {
             const float* vh = v_cache + ((size_t)s * kv_step + kv_head_off);
-            float sv = scores[t];
-            cblas_saxpy(head_dim, sv, vh, 1, oh, 1);
+            cblas_saxpy(head_dim, scores[t], vh, 1, oh, 1);
         }
+    };
+
+    // Parallel for ctx >= 128: all heads are independent (disjoint writes to out)
+    // Sequential for short ctx to avoid dispatch_apply overhead
+    if (cache_len >= 128 && n_heads >= 4) {
+        dispatch_apply(n_heads,
+            dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+            ^(size_t h) { head_fn((int)h); });
+    } else {
+        for (int h = 0; h < n_heads; h++) head_fn(h);
     }
+
+    free(scores_buf);
 }
 
 } // namespace ane_lm
