@@ -653,12 +653,12 @@ bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int
         const __fp16* out_h = (const __fp16*)out_base;
         int c = 0, idx = 0;
         for (; c + 3 < out_dim; c += 4, idx += 4 * ANE_SPATIAL) {
-            float16x4_t h;
-            h = vset_lane_f16(out_h[idx + 0*ANE_SPATIAL], h, 0);
-            h = vset_lane_f16(out_h[idx + 1*ANE_SPATIAL], h, 1);
-            h = vset_lane_f16(out_h[idx + 2*ANE_SPATIAL], h, 2);
-            h = vset_lane_f16(out_h[idx + 3*ANE_SPATIAL], h, 3);
-            vst1q_f32(&output[c], vcvt_f32_f16(h));
+            // Proper aggregate init (avoids UB with uninitialized float16x4_t)
+            float16_t hv[4] = {
+                out_h[idx + 0*ANE_SPATIAL], out_h[idx + 1*ANE_SPATIAL],
+                out_h[idx + 2*ANE_SPATIAL], out_h[idx + 3*ANE_SPATIAL]
+            };
+            vst1q_f32(&output[c], vcvt_f32_f16(vld1_f16(hv)));
         }
         for (; c < out_dim; c++, idx += ANE_SPATIAL) output[c] = (float)out_h[idx];
     }
