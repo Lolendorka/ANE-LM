@@ -1,6 +1,8 @@
 #include "qwen3_5.h"
 #include "../../core/cpu_ops.h"
+#include <atomic>
 #include <cmath>
+#include <dispatch/dispatch.h>
 #include <fstream>
 #include <sys/stat.h>
 
@@ -13,7 +15,6 @@ using json = nlohmann::json;
 Qwen35Args Qwen35Args::from_json(const json& j) {
     Qwen35Args args;
 
-    // Parse text_config if present, otherwise read from top level
     const json& tc = j.contains("text_config") ? j["text_config"] : j;
 
     args.hidden_size = tc.value("hidden_size", args.hidden_size);
@@ -33,7 +34,6 @@ Qwen35Args Qwen35Args::from_json(const json& j) {
     args.linear_num_value_heads = tc.value("linear_num_value_heads", args.linear_num_value_heads);
     args.linear_conv_kernel_dim = tc.value("linear_conv_kernel_dim", args.linear_conv_kernel_dim);
 
-    // RoPE parameters
     if (tc.contains("rope_parameters")) {
         auto& rp = tc["rope_parameters"];
         args.rope_theta = rp.value("rope_theta", args.rope_theta);
@@ -43,7 +43,6 @@ Qwen35Args Qwen35Args::from_json(const json& j) {
         args.partial_rotary_factor = tc.value("partial_rotary_factor", args.partial_rotary_factor);
     }
 
-    // Layer types
     if (tc.contains("layer_types")) {
         for (auto& lt : tc["layer_types"]) {
             std::string s = lt.get<std::string>();
@@ -158,7 +157,6 @@ void Qwen35Model::apply_args(const Qwen35Args& args) {
 }
 
 bool Qwen35Model::load(const std::string& model_dir) {
-    // 1. Read config.json and parse args
     std::string config_path = model_dir + "/config.json";
     std::ifstream f(config_path);
     if (!f.is_open()) {
@@ -169,14 +167,12 @@ bool Qwen35Model::load(const std::string& model_dir) {
     Qwen35Args args = Qwen35Args::from_json(j);
     apply_args(args);
 
-    // 2. Open model weights (single-file or sharded)
     auto sf = ModelWeights::open(model_dir);
     if (!sf) {
         fprintf(stderr, "Failed to open model weights in %s\n", model_dir.c_str());
         return false;
     }
 
-    // Infer dims from safetensors
     const SFTensor* embed = sf->find("model.language_model.embed_tokens.weight");
     if (!embed || embed->ndims != 2) {
         fprintf(stderr, "Cannot infer dims: missing or invalid embed_tokens.weight\n");
@@ -195,10 +191,8 @@ bool Qwen35Model::load(const std::string& model_dir) {
     LOG("Model dims: hidden=%d intermediate=%d vocab=%d layers=%d\n",
         hidden_size_, intermediate_size_, vocab_size_, num_layers_);
 
-    // 3. Init ANE
     ane_init();
 
-    // Allocate scratch buffers
     x_ = (float*)calloc(hidden_size_, sizeof(float));
     x_norm_ = (float*)calloc(hidden_size_, sizeof(float));
     logits_ = (float*)calloc(vocab_size_, sizeof(float));
@@ -206,12 +200,10 @@ bool Qwen35Model::load(const std::string& model_dir) {
     scratch_conv_ = (float*)calloc(lin_qkv_dim_, sizeof(float));
     scratch_y_ = (float*)calloc(lin_total_val_, sizeof(float));
     scratch_attn_ = (float*)calloc(full_out_dim_, sizeof(float));
-    // scratch_tmp_: a_vec (lin_num_val_heads_) + b_vec (lin_num_val_heads_) + silu_tmp (lin_qkv_dim_)
     scratch_tmp_ = (float*)calloc((size_t)lin_num_val_heads_ * 2 + lin_qkv_dim_, sizeof(float));
     rope_cos_ = (float*)calloc((size_t)MAX_SEQ_LEN * (rot_dim_ / 2), sizeof(float));
     rope_sin_ = (float*)calloc((size_t)MAX_SEQ_LEN * (rot_dim_ / 2), sizeof(float));
 
-    // Precompute RoPE trig table
     if (rope_cos_ && rope_sin_) {
         int half_rot = rot_dim_ / 2;
         float inv_freq[half_rot];
@@ -229,7 +221,6 @@ bool Qwen35Model::load(const std::string& model_dir) {
         }
     }
 
-    // Initialize layers
     layers_.resize(num_layers_);
     delta_states_.resize(num_layers_);
     kv_caches_.resize(num_layers_);
@@ -252,9 +243,7 @@ bool Qwen35Model::load(const std::string& model_dir) {
         }
     }
 
-    // 4. Load weights + compile ANE kernels
     if (!load_weights(sf.get())) { return false; }
-    // Detect pre-converted ANE blob directory
     std::string blob_dir = model_dir + "/ane_weights";
     struct stat st_blob;
     bool has_blobs = (stat(blob_dir.c_str(), &st_blob) == 0 && S_ISDIR(st_blob.st_mode));
@@ -292,7 +281,6 @@ bool Qwen35Model::load_weights(ModelWeights* sf) {
         if (lw.type == LayerType::LinearAttention) {
             auto& dw = lw.deltanet;
 
-            // Note: in_proj_a/b, A_log, dt_bias use linear_num_value_heads (not key_heads)
             snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_a.weight", L);
             dw.in_proj_a = sf->load_bf16_to_f32(name, (int64_t)lin_num_val_heads_ * hidden_size_);
 
@@ -339,7 +327,6 @@ bool Qwen35Model::load_weights(ModelWeights* sf) {
     return true;
 }
 
-// Convert tensor name to blob path: "a.b.c" → "<dir>/a/b/c.bin"
 static std::string blob_path(const std::string& dir, const char* tensor_name) {
     std::string p = dir + "/";
     for (const char* c = tensor_name; *c; c++) {
@@ -399,7 +386,6 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
             return false;
         }
 
-        // O projection
         int attn_dim;
         if (layer_types_[L] == LayerType::LinearAttention) {
             snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.out_proj.weight", L);
@@ -418,7 +404,6 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
             return false;
         }
 
-        // Fused FFN
         snprintf(name, sizeof(name), "model.language_model.layers.%d.mlp.gate_proj.weight", L);
         snprintf(name2, sizeof(name2), "model.language_model.layers.%d.mlp.up_proj.weight", L);
         snprintf(name3, sizeof(name3), "model.language_model.layers.%d.mlp.down_proj.weight", L);
@@ -443,7 +428,6 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
     LOG("  %d ANE layer kernels ready (compiled=%d, cached=%d)\n",
         compiled + cached, compiled, cached);
 
-    // Compile LM head
     if (!compile_lm_head_ane(sf, blob_dir)) {
         LOG("ANE LM head disabled, falling back to CPU\n");
     } else {
@@ -456,7 +440,6 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
 bool Qwen35Model::compile_lm_head_ane(ModelWeights* sf, const std::string& blob_dir) {
     bool use_blobs = !blob_dir.empty();
 
-    // For blob mode, we need the embed blob; for bf16 mode, the bf16 pointer
     const uint16_t* embed_bf16 = nullptr;
     if (!use_blobs) {
         embed_bf16 = sf->get_bf16_ptr("model.language_model.embed_tokens.weight");
@@ -481,9 +464,6 @@ bool Qwen35Model::compile_lm_head_ane(ModelWeights* sf, const std::string& blob_
         LOG("    LM head chunk %d/%d...\r", c + 1, chunks);
 
         if (use_blobs) {
-            // LM head reuses embed_tokens weight, chunked by row offset
-            // Blob was written as one file; we need per-chunk blobs or fall back to bf16
-            // For now: fall back to bf16 for LM head since embed_tokens is one big blob
             embed_bf16 = sf->get_bf16_ptr("model.language_model.embed_tokens.weight");
             if (!embed_bf16) return false;
             const uint16_t* chunk_w = embed_bf16 + (int64_t)offset * hidden_size_;
@@ -524,28 +504,19 @@ bool Qwen35Model::forward_deltanet_core(int L, float* x, float* pre_oproj) {
     float* mixed_qkv = qkv_z;
     float* z = qkv_z + lin_qkv_dim_;
 
-    // Small projections on CPU
-    // Note: in_proj_a/b output dim is lin_num_val_heads_
     float* a_vec = scratch_tmp_;
     float* b_vec = scratch_tmp_ + lin_num_val_heads_;
     matvec(a_vec, dw.in_proj_a, x, lin_num_val_heads_, hidden_size_);
     matvec(b_vec, dw.in_proj_b, x, lin_num_val_heads_, hidden_size_);
 
-    // Causal conv1d + SiLU
     float* conv_out = scratch_conv_;
     conv1d_update(conv_out, st.conv_state, &st.conv_pos, mixed_qkv, dw.conv1d_w, lin_qkv_dim_, conv_kernel_);
     silu_vec_inplace(conv_out, lin_qkv_dim_, scratch_tmp_ + lin_num_val_heads_ * 2);
 
-    // Split into Q, K, V
-    // Q and K have lin_num_heads_ heads, V has lin_num_val_heads_ heads
-    // Each key head corresponds to (lin_num_val_heads_ / lin_num_heads_) value heads
     float* Q = conv_out;
     float* K = conv_out + lin_total_key_;
     float* V = conv_out + lin_total_key_ * 2;
 
-    // Per-head SSM
-    // Architecture: 16 key heads, 32 value heads
-    // Each key head pairs with 2 value heads (val_heads_per_key = 2)
     float* y = scratch_y_;
     float q_scale = 1.0f / sqrtf((float)lin_key_dim_);
     int val_heads_per_key = lin_num_val_heads_ / lin_num_heads_;
@@ -571,7 +542,6 @@ bool Qwen35Model::forward_deltanet_core(int L, float* x, float* pre_oproj) {
         }
     }
 
-    // RMSNorm gated
     for (int h = 0; h < lin_num_val_heads_; h++) {
         rmsnorm_gated(pre_oproj + h * lin_val_dim_,
                       y + h * lin_val_dim_,
@@ -596,16 +566,25 @@ bool Qwen35Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int 
     float* k_raw = qkv_buf + full_q_dim_;
     float* v_raw = qkv_buf + full_q_dim_ + full_kv_dim_;
 
-    // RMSNorm on Q and K per-head
-    for (int h = 0; h < num_q_heads_; h++) {
-        float* qh = q_gate_raw + (size_t)h * head_dim_ * 2;
-        rmsnorm(qh, qh, fw.q_norm, head_dim_, rms_eps_);
-    }
-    for (int h = 0; h < num_kv_heads_; h++) {
-        rmsnorm(k_raw + h * head_dim_, k_raw + h * head_dim_, fw.k_norm, head_dim_, rms_eps_);
-    }
+    // ============ PATCH 6: Parallel Q/K per-head RMSNorm via dispatch_apply ============
+    int nqh = num_q_heads_, nkh = num_kv_heads_;
+    float eps = rms_eps_;
+    float* q_n = fw.q_norm;
+    float* k_n = fw.k_norm;
+    int hd = head_dim_;
+    // Note: q_gate_raw stride is head_dim*2 (interleaved with gate)
+    dispatch_apply(nqh + nkh,
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+        ^(size_t h) {
+            if (h < (size_t)nqh) {
+                float* qh = q_gate_raw + h * hd * 2;  // stride=head_dim*2 for q+gate
+                rmsnorm(qh, qh, q_n, hd, eps);
+            } else {
+                float* kh = k_raw + (h - nqh) * hd;
+                rmsnorm(kh, kh, k_n, hd, eps);
+            }
+        });
 
-    // RoPE
     const float* rope_cos_row = nullptr;
     const float* rope_sin_row = nullptr;
     if (pos >= 0 && pos < MAX_SEQ_LEN && rope_cos_ && rope_sin_) {
@@ -617,7 +596,6 @@ bool Qwen35Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int 
                       head_dim_, head_dim_ * 2, head_dim_, rot_dim_, pos, rope_theta_,
                       rope_cos_row, rope_sin_row);
 
-    // KV cache update
     int slot;
     if (cache.len < cache.capacity) {
         slot = cache.start + cache.len;
@@ -632,12 +610,10 @@ bool Qwen35Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int 
     memcpy(cache.k_cache + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
     memcpy(cache.v_cache + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
 
-    // GQA attention
     gqa_attention(pre_oproj, q_gate_raw, cache.k_cache, cache.v_cache,
                   num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
                   cache.start, cache.len, cache.capacity);
 
-    // Output gate
     if (attn_output_gate_) {
         for (int h = 0; h < num_q_heads_; h++) {
             float* oh = pre_oproj + h * head_dim_;
@@ -649,23 +625,19 @@ bool Qwen35Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int 
 }
 
 float* Qwen35Model::forward(int token, int pos) {
-    // Embedding lookup
     memcpy(x_, embed_tokens_ + (int64_t)token * hidden_size_, hidden_size_ * sizeof(float));
 
     float* pre_oproj = scratch_attn_;
 
     for (int L = 0; L < num_layers_; L++) {
-        // Pre-attention norm
         rmsnorm(x_norm_, x_, layers_[L].input_layernorm, hidden_size_, rms_eps_);
 
-        // Attention core
         if (layer_types_[L] == LayerType::LinearAttention) {
             if (!forward_deltanet_core(L, x_norm_, pre_oproj)) return nullptr;
         } else {
             if (!forward_full_attn_core(L, x_norm_, pre_oproj, pos)) return nullptr;
         }
 
-        // O projection (ANE)
         int attn_dim = (layer_types_[L] == LayerType::LinearAttention) ? lin_total_val_ : full_out_dim_;
         float* attn_out = x_norm_;
         if (!ane_matvec(ane_layers_[L].o_proj, attn_out, pre_oproj, attn_dim, hidden_size_)) {
@@ -673,41 +645,45 @@ float* Qwen35Model::forward(int token, int pos) {
             return nullptr;
         }
 
-        // Residual 1
-        for (int i = 0; i < hidden_size_; i++) x_[i] += attn_out[i];
+        // ============ PATCH 2: vDSP_vadd for residual (was scalar loop) ============
+        vDSP_vadd(x_, 1, attn_out, 1, x_, 1, (vDSP_Length)hidden_size_);
 
-        // Post-attention norm
         rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
 
-        // Fused FFN (ANE)
         float* mlp_out = scratch_attn_;
         if (!ane_matvec(ane_layers_[L].fused_ffn, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
             fprintf(stderr, "ANE fused_ffn eval failed at layer %d\n", L);
             return nullptr;
         }
 
-        // Residual 2
-        for (int i = 0; i < hidden_size_; i++) x_[i] += mlp_out[i];
+        // ============ PATCH 2: vDSP_vadd for residual (was scalar loop) ============
+        vDSP_vadd(x_, 1, mlp_out, 1, x_, 1, (vDSP_Length)hidden_size_);
     }
 
-    // Final norm
     rmsnorm(x_, x_, final_norm_, hidden_size_, rms_eps_);
 
-    // LM head
+    // ============ PATCH 4: Parallel LM head chunks via dispatch_apply ============
     if (ane_lm_head_enabled_ && !lm_head_kernels_.empty()) {
-        bool ok = true;
         int chunks = (int)lm_head_kernels_.size();
-        for (int c = 0; c < chunks; c++) {
-            int offset = c * lm_head_chunk_;
-            int rows = vocab_size_ - offset;
-            if (rows > lm_head_chunk_) rows = lm_head_chunk_;
-            if (!ane_matvec(lm_head_kernels_[c], logits_ + offset, x_, hidden_size_, rows)) {
-                fprintf(stderr, "ANE LM head eval failed at chunk %d/%d, falling back to CPU\n", c + 1, chunks);
-                ok = false;
-                break;
-            }
-        }
-        if (!ok) {
+        std::atomic<bool> lm_ok{true};
+        int chunk_sz = lm_head_chunk_;
+        int vocab = vocab_size_;
+        float* x_ptr = x_;
+        int hsz = hidden_size_;
+        float* logits_ptr = logits_;
+        dispatch_apply(chunks,
+            dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+            ^(size_t c) {
+                if (!lm_ok.load(std::memory_order_relaxed)) return;
+                int offset = (int)c * chunk_sz;
+                int rows = vocab - offset;
+                if (rows > chunk_sz) rows = chunk_sz;
+                if (!ane_matvec(lm_head_kernels_[c],
+                                logits_ptr + offset, x_ptr, hsz, rows)) {
+                    lm_ok.store(false, std::memory_order_relaxed);
+                }
+            });
+        if (!lm_ok.load()) {
             free_lm_head_ane();
             matvec(logits_, embed_tokens_, x_, vocab_size_, hidden_size_);
         }
