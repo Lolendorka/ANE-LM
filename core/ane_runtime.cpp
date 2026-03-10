@@ -109,6 +109,16 @@ static int g_compile_count = 0;
 static bool g_ane_persist_cache = true;
 static int g_ane_cache_load_count = 0;
 
+// Cached singleton empty NSDictionary -- avoids 90+ ObjC allocations per token
+static id g_cached_empty_dict = nullptr;
+static std::once_flag g_cached_empty_dict_once;
+static id get_cached_empty_dict() {
+    std::call_once(g_cached_empty_dict_once, []() {
+        g_cached_empty_dict = objc_retain_obj(ns_empty_dict());
+    });
+    return g_cached_empty_dict;
+}
+
 void ane_set_persist_cache(bool enabled) { g_ane_persist_cache = enabled; }
 int ane_compile_count() { return g_compile_count; }
 int ane_cache_loads() { return g_ane_cache_load_count; }
@@ -581,7 +591,7 @@ static bool ane_eval_raw(ANEKernel* k) {
     id e = nullptr;
     bool ok = ((bool(*)(id,SEL,unsigned int,id,id,id*))objc_msgSend)(
         k->model, sel("evaluateWithQoS:options:request:error:"),
-        21, ns_empty_dict(), k->request, &e);
+        21, get_cached_empty_dict(), k->request, &e);
     if (!ok) {
         fprintf(stderr, "ANE eval failed: %s\n",
             e ? to_cstr(((id(*)(id,SEL))objc_msgSend)(e, sel("description"))) : "unknown");
