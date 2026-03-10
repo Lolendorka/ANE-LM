@@ -45,25 +45,12 @@ void stream_generate(
         prompt_tokens = tokenizer.encode(combined);
     }
 
-    // ============ PERF: Prefill skip LM head for intermediate tokens ============
-    // prefill_step() runs transformer only (no LM head = ~10 ANE dispatches saved per token).
-    // Only the LAST prefill token needs logits. For a 512-token prompt this saves ~5000
-    // unnecessary ANE dispatches during prefill.
     Timer prefill_timer;
     float* logits = nullptr;
-    if (!prompt_tokens.empty()) {
-        // All tokens except the last: transformer-only, no LM head
-        for (int i = 0; i < (int)prompt_tokens.size() - 1; i++) {
-            if (!model.prefill_step(prompt_tokens[i], i)) {
-                fprintf(stderr, "Prefill failed at token index %d\n", i);
-                return;
-            }
-        }
-        // Last token: full forward with LM head to get logits for first generated token
-        int last = (int)prompt_tokens.size() - 1;
-        logits = model.forward(prompt_tokens[last], last);
+    for (int i = 0; i < (int)prompt_tokens.size(); i++) {
+        logits = model.forward(prompt_tokens[i], i);
         if (!logits) {
-            fprintf(stderr, "Forward failed at last prefill token\n");
+            fprintf(stderr, "Forward failed during prefill at token index %d\n", i);
             return;
         }
     }
