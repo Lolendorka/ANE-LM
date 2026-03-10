@@ -380,9 +380,5 @@ float* Qwen3Model::forward(int token_id, int pos) {
     return logits_;
 }
 
-bool Qwen3Model::prefill_step(int token_id, int pos) {
-    skip_lm_head_ = true;
-    return forward(token_id, pos) != nullptr;
-}
 
 } // namespace ane_lm
