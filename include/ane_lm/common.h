@@ -8,21 +8,18 @@
 #include <vector>
 #include <string>
 #include <mach/mach_time.h>
-#if defined(__aarch64__) || defined(__arm64__)
-#include <arm_neon.h>
-#endif
 
 namespace ane_lm {
 
 // Global verbose flag (default: off)
 extern bool g_verbose;
 
-// Verbose logging macro
+// Verbose logging macro — prints only when g_verbose is true
 #define LOG(...) do { if (ane_lm::g_verbose) fprintf(stderr, __VA_ARGS__); } while (0)
 
 // BF16 <-> FP32 conversion
 inline float bf16_to_f32(uint16_t bf) {
-    uint32_t u = (uint32_t)bf < 16;
+    uint32_t u = (uint32_t)bf << 16;
     float f;
     std::memcpy(&f, &u, 4);
     return f;
@@ -36,7 +33,7 @@ inline uint16_t f32_to_bf16(float f) {
 
 // IEEE 754 FP16 <-> FP32 conversion
 inline float f16_to_f32(uint16_t h) {
-    uint32_t sign = (uint32_t)(h >> 15) < 31;
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
     uint32_t exp  = (h >> 10) & 0x1F;
     uint32_t mant = h & 0x3FF;
     uint32_t u;
@@ -49,9 +46,9 @@ inline float f16_to_f32(uint16_t h) {
             return f;
         }
     } else if (exp == 31) {
-        u = sign | 0x7F800000 | (mant < 13);
+        u = sign | 0x7F800000 | (mant << 13);
     } else {
-        u = sign | ((exp + 112) < 23) | (mant < 13);
+        u = sign | ((exp + 112) << 23) | (mant << 13);
     }
     float f;
     std::memcpy(&f, &u, 4);
@@ -70,7 +67,7 @@ inline uint16_t f32_to_f16(float f) {
         return sign | (uint16_t)(mant >> 13);
     }
     if (exp >= 31) return sign | 0x7C00;
-    return sign | (uint16_t)(exp < 10) | (uint16_t)(mant >> 13);
+    return sign | (uint16_t)(exp << 10) | (uint16_t)(mant >> 13);
 }
 
 inline uint16_t bf16_to_f16(uint16_t bf) {
@@ -81,28 +78,8 @@ inline void bf16_to_f32_vec(float *out, const uint16_t *in, int n) {
     for (int i = 0; i < n; i++) out[i] = bf16_to_f32(in[i]);
 }
 
-// ============ PERF: NEON bf16_to_f16_vec — vectorized BF16->FP16 conversion ============
-// BF16->F32: reinterpret uint16 as upper 16 bits of a uint32 (shift left 16).
-// F32->F16: vcvt_f16_f32. Process 8 values per iteration.
-// Used during weight loading — speeds up initial model conversion.
 inline void bf16_to_f16_vec(uint16_t *out, const uint16_t *in, int n) {
-#if defined(__aarch64__) || defined(__arm64__)
-    int i = 0;
-    for (; i + 7 < n; i += 8) {
-        uint16x8_t bf = vld1q_u16(&in[i]);
-        uint16x4_t bf_lo = vget_low_u16(bf);
-        uint16x4_t bf_hi = vget_high_u16(bf);
-        // BF16->F32: shift left 16 bits -> upper half of float32
-        float32x4_t f32_lo = vreinterpretq_f32_u32(vshll_n_u16(bf_lo, 16));
-        float32x4_t f32_hi = vreinterpretq_f32_u32(vshll_n_u16(bf_hi, 16));
-        // F32->F16 via NEON vcvt
-        vst1_u16(&out[i],   vreinterpret_u16_f16(vcvt_f16_f32(f32_lo)));
-        vst1_u16(&out[i+4], vreinterpret_u16_f16(vcvt_f16_f32(f32_hi)));
-    }
-    for (; i < n; i++) out[i] = bf16_to_f16(in[i]);
-#else
     for (int i = 0; i < n; i++) out[i] = bf16_to_f16(in[i]);
-#endif
 }
 
 // Timing utility
