@@ -1,6 +1,7 @@
 #include "qwen3_5.h"
 #include <ane_lm/common.h>
 #include "../../core/cpu_ops.h"
+#include "../../core/metal_ops.h"
 #include <atomic>
 #include <cmath>
 #include <dispatch/dispatch.h>
@@ -663,11 +664,19 @@ bool Qwen35Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int 
             v_f32[fs + _i] = f16_to_f32(cache.v_cache[_i]);
         }
 #endif
-        // gqa_attention with linearized (unwrapped) fp32 KV cache
-        // cache_start=0 since we already unwrapped the ring buffer
-        gqa_attention(pre_oproj, q_gate_raw, k_f32, v_f32,
-                      num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
-                      0, cache.len, cache.len);
+        // Use Metal GPU for attention when available (faster for long contexts)
+        if (metal_available() && cache.len >= 64) {
+            // Metal path: operates directly on fp16 KV cache (no conversion needed!)
+            metal_gqa_attention(pre_oproj, q_gate_raw,
+                                cache.k_cache, cache.v_cache,
+                                num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
+                                cache.start, cache.len, cache.capacity);
+        } else {
+            // CPU fallback with fp32 converted cache
+            gqa_attention(pre_oproj, q_gate_raw, k_f32, v_f32,
+                          num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
+                          0, cache.len, cache.len);
+        }
     }
 
     if (attn_output_gate_) {

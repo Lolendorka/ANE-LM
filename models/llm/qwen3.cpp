@@ -1,6 +1,7 @@
 #include "qwen3.h"
 #include <ane_lm/common.h>
 #include "../../core/cpu_ops.h"
+#include "../../core/metal_ops.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -364,9 +365,16 @@ bool Qwen3Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int p
             v_f32[(size_t)fs * kv_row + _i] = f16_to_f32(cache.v_cache[_i]);
         }
 #endif
-        gqa_attention(pre_oproj, q_raw, k_f32, v_f32,
-                      num_q_heads_, num_kv_heads_, head_dim_, head_dim_,
-                      0, cache.len, cache.len);
+        if (metal_available() && cache.len >= 64) {
+            metal_gqa_attention(pre_oproj, q_raw,
+                                cache.k_cache, cache.v_cache,
+                                num_q_heads_, num_kv_heads_, head_dim_, head_dim_,
+                                cache.start, cache.len, cache.capacity);
+        } else {
+            gqa_attention(pre_oproj, q_raw, k_f32, v_f32,
+                          num_q_heads_, num_kv_heads_, head_dim_, head_dim_,
+                          0, cache.len, cache.len);
+        }
     }
     return true;
 }

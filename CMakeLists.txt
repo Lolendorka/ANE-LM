@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ane-lm VERSION 0.1.0 LANGUAGES C CXX)
+project(ane-lm VERSION 0.1.0 LANGUAGES C CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -49,6 +49,7 @@ set(CORE_SOURCES
     core/cpu_ops.cpp
     core/sampling.cpp
     core/ane_runtime.cpp
+    core/metal_ops.mm
     utils.cpp
     generate.cpp
 )
@@ -78,7 +79,9 @@ target_link_libraries(ane-lm PRIVATE
     "-framework IOSurface"
     "-framework Accelerate"
     "-lobjc"
-)
+
+    "-framework Metal"
+    "-framework Foundation")
 
 # Optimization for release
 target_compile_options(ane-lm PRIVATE

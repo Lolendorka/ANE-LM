@@ -1,5 +1,6 @@
 #include "utils.h"
 #include "core/ane_runtime.h"
+#include "core/metal_ops.h"
 #include <ane_lm/common.h>
 #include <nlohmann/json.hpp>
 #include <fstream>
@@ -33,6 +34,9 @@ std::pair<std::unique_ptr<LLMModel>, Tokenizer> load(
     } else {
         throw std::runtime_error("Unsupported model_type: " + model_type);
     }
+
+    // Initialize Metal GPU compute
+    metal_init();
 
     // Set ANE cache preference before model loads
     ane_set_persist_cache(ane_cache);
