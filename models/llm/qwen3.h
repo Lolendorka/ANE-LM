@@ -2,6 +2,7 @@
 
 #include "qwen3_5.h"
 #include "../../core/ane_runtime.h"
+#include "../../core/metal_ops.h"
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -74,6 +75,16 @@ private:
     std::vector<LayerWeights> layers_;
     std::vector<KVCache> kv_caches_;
     std::vector<LayerANEKernels> ane_layers_;
+
+    struct LayerMetalWeights {
+        MetalWeight* first_proj = nullptr;
+        MetalWeight* o_proj = nullptr;
+        MetalWeight* gate_proj = nullptr;
+        MetalWeight* up_proj = nullptr;
+        MetalWeight* down_proj = nullptr;
+    };
+    std::vector<LayerMetalWeights> metal_layers_;
+    bool use_metal_matmul_ = false;
 
     float* embed_tokens_ = nullptr;
     float* lm_head_ = nullptr;

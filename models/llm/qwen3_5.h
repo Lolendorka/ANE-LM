@@ -2,6 +2,7 @@
 
 #include "../../core/model_loader.h"
 #include "../../core/ane_runtime.h"
+#include "../../core/metal_ops.h"
 #include <nlohmann/json.hpp>
 #include <memory>
 #include <string>
@@ -151,6 +152,17 @@ private:
     std::vector<DeltaNetState> delta_states_;
     std::vector<KVCache> kv_caches_;
     std::vector<LayerANEKernels> ane_layers_;
+
+    // Metal GPU weight buffers (alternative to ANE for matmuls)
+    struct LayerMetalWeights {
+        MetalWeight* first_proj = nullptr;
+        MetalWeight* o_proj = nullptr;
+        MetalWeight* gate_proj = nullptr;
+        MetalWeight* up_proj = nullptr;
+        MetalWeight* down_proj = nullptr;
+    };
+    std::vector<LayerMetalWeights> metal_layers_;
+    bool use_metal_matmul_ = false;  // set by --use-metal flag
 
     // LM head ANE kernels
     std::vector<ANEKernel*> lm_head_kernels_;

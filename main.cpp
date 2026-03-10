@@ -34,6 +34,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --temp T          Temperature (default: 0.6)\n");
     fprintf(stderr, "  --repeat-penalty P Repetition penalty (default: 1.2, 1.0=off)\n");
     fprintf(stderr, "  --enable-thinking Enable thinking/reasoning mode\n");
+    fprintf(stderr, "  --use-metal       Use Metal GPU for matmuls (may be faster than ANE)\n");
     fprintf(stderr, "  --no-ane-cache    Disable persistent ANE compile cache\n");
     fprintf(stderr, "  -v, --verbose     Show detailed initialization info\n");
     fprintf(stderr, "\nExamples:\n");
@@ -49,6 +50,7 @@ struct Args {
     float repetition_penalty = 1.2f;
     bool ane_cache = true;
     bool enable_thinking = false;
+    bool use_metal = false;
 };
 
 static Args parse_args(int argc, char* argv[], int start) {
@@ -66,6 +68,8 @@ static Args parse_args(int argc, char* argv[], int start) {
             args.repetition_penalty = atof(argv[++i]);
         } else if (strcmp(argv[i], "--enable-thinking") == 0) {
             args.enable_thinking = true;
+        } else if (strcmp(argv[i], "--use-metal") == 0) {
+            args.use_metal = true;
         } else if (strcmp(argv[i], "--no-ane-cache") == 0) {
             args.ane_cache = false;
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
@@ -246,6 +250,11 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Error: %s\n", e.what());
         objc_autoreleasePoolPop(pool);
         return 1;
+    }
+
+    // Enable Metal matmul if requested
+    if (args.use_metal && metal_available()) {
+        LOG("Using Metal GPU for matmuls\n");
     }
 
     int ret;
