@@ -98,7 +98,7 @@ private:
 
     static constexpr int MAX_SEQ_LEN = 4096;
     static constexpr int KV_CACHE_CAPACITY = 2048;
-    static constexpr int LM_HEAD_ANE_CHUNK_MAX = 65536;  // larger chunk = fewer dispatches
+    static constexpr int LM_HEAD_ANE_CHUNK_MAX = 32768;  // balanced: fewer dispatches + ANE compatible
 
     std::vector<LayerType> layer_types_;
 

@@ -476,6 +476,12 @@ bool Qwen35Model::compile_lm_head_ane(ModelWeights* sf, const std::string& blob_
         if (!lm_head_kernels_[c]) {
             fprintf(stderr, "\nANE LM head: compile failed at chunk %d/%d\n", c + 1, chunks);
             free_lm_head_ane();
+            // Auto-retry with half chunk size if ANE can't handle large chunks
+            if (chunk > 4096) {
+                lm_head_chunk_ = chunk / 2;
+                LOG("  Retrying LM head with chunk=%d...\n", lm_head_chunk_);
+                return compile_lm_head_ane(sf, blob_dir);
+            }
             return false;
         }
     }
