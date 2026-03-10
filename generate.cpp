@@ -18,7 +18,6 @@ static size_t longest_common_prefix_len(const std::string& a, const std::string&
     return i;
 }
 
-// Move cut position to a UTF-8 codepoint boundary at or before cut.
 static size_t utf8_boundary_at_or_before(const std::string& s, size_t cut) {
     if (cut >= s.size()) return s.size();
     while (cut > 0 && is_utf8_continuation(static_cast<uint8_t>(s[cut]))) {
@@ -36,41 +35,47 @@ void stream_generate(
     const SamplingParams& sampling,
     std::function<void(const GenerationResponse&)> callback)
 {
-    // Tokenize with chat template
     std::vector<int> prompt_tokens;
     if (tokenizer.has_chat_template()) {
         std::string formatted = tokenizer.apply_chat_template(messages, true, enable_thinking);
         prompt_tokens = tokenizer.encode(formatted);
     } else {
-        // Fallback: concatenate all message contents
         std::string combined;
-        for (auto& [role, content] : messages) {
-            combined += content + "\n";
-        }
+        for (auto& [role, content] : messages) combined += content + "\n";
         prompt_tokens = tokenizer.encode(combined);
     }
 
-    // Prefill
+    // ============ PERF: Prefill skip LM head for intermediate tokens ============
+    // prefill_step() runs transformer only (no LM head = ~10 ANE dispatches saved per token).
+    // Only the LAST prefill token needs logits. For a 512-token prompt this saves ~5000
+    // unnecessary ANE dispatches during prefill.
     Timer prefill_timer;
     float* logits = nullptr;
-    for (int i = 0; i < (int)prompt_tokens.size(); i++) {
-        logits = model.forward(prompt_tokens[i], i);
+    if (!prompt_tokens.empty()) {
+        // All tokens except the last: transformer-only, no LM head
+        for (int i = 0; i < (int)prompt_tokens.size() - 1; i++) {
+            if (!model.prefill_step(prompt_tokens[i], i)) {
+                fprintf(stderr, "Prefill failed at token index %d\n", i);
+                return;
+            }
+        }
+        // Last token: full forward with LM head to get logits for first generated token
+        int last = (int)prompt_tokens.size() - 1;
+        logits = model.forward(prompt_tokens[last], last);
         if (!logits) {
-            fprintf(stderr, "Forward failed during prefill at token index %d\n", i);
+            fprintf(stderr, "Forward failed at last prefill token\n");
             return;
         }
     }
     double prefill_ms = prefill_timer.elapsed_ms();
     double prompt_tps = prompt_tokens.size() / (prefill_ms / 1000.0);
 
-    // Sample only over token ids supported by both model logits and tokenizer decode.
     int sampler_vocab = std::min(model.vocab_size(), tokenizer.vocab_size());
     if (sampler_vocab <= 0) {
         fprintf(stderr, "Invalid sampler vocab size: %d\n", sampler_vocab);
         return;
     }
 
-    // Decode
     Timer gen_timer;
     int n_generated = 0;
     std::vector<int> generated_tokens;
@@ -99,7 +104,6 @@ void stream_generate(
                 piece = stable_decoded.substr(emitted_text.size());
                 emitted_text = std::move(stable_decoded);
             } else {
-                // Fallback: find current common prefix with emitted text first.
                 size_t p = longest_common_prefix_len(stable_decoded, emitted_text);
                 p = utf8_boundary_at_or_before(stable_decoded, p);
                 piece = stable_decoded.substr(p);
@@ -129,7 +133,7 @@ void stream_generate(
         next_token = sample_token(logits, sampler_vocab, sampling, generated_tokens);
     }
 
-    // Flush any remaining tail at end.
+    // Flush remaining tail
     if (callback && has_prev_decoded) {
         std::string final_decoded = prev_decoded;
         std::string tail;
@@ -142,7 +146,6 @@ void stream_generate(
                    final_decoded[p] == emitted_text[p]) p++;
             tail = final_decoded.substr(p);
         }
-
         if (!tail.empty()) {
             GenerationResponse r;
             r.text = tail;
@@ -167,7 +170,6 @@ void stream_generate(
     }
 }
 
-// Single-prompt overload wraps into messages vector
 void stream_generate(
     LLMModel& model,
     Tokenizer& tokenizer,
@@ -177,9 +179,7 @@ void stream_generate(
     const SamplingParams& sampling,
     std::function<void(const GenerationResponse&)> callback)
 {
-    std::vector<std::pair<std::string, std::string>> messages = {
-        {"user", prompt}
-    };
+    std::vector<std::pair<std::string, std::string>> messages = {{"user", prompt}};
     stream_generate(model, tokenizer, messages, max_tokens, enable_thinking, sampling, std::move(callback));
 }
 
