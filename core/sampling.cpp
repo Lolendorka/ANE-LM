@@ -4,6 +4,7 @@
 #include <cstring>
 #include <algorithm>
 #include <unordered_map>
+#include <Accelerate/Accelerate.h>
 
 namespace ane_lm {
 
@@ -15,44 +16,36 @@ int sample_token(const float* logits, int vocab_size,
 
     if (!recent_tokens.empty()) {
         int start = std::max(0, (int)recent_tokens.size() - params.repetition_context_size);
-
-        // Count token frequencies in the context window
         std::unordered_map<int, int> freq;
         for (int j = start; j < (int)recent_tokens.size(); j++) {
             int tok = recent_tokens[j];
-            if (tok >= 0 && tok < vocab_size) {
-                freq[tok]++;
-            }
+            if (tok >= 0 && tok < vocab_size) freq[tok]++;
         }
-
-        // Apply repetition penalty + frequency penalty
         for (auto& [tok, count] : freq) {
-            // Repetition penalty (https://arxiv.org/abs/1909.05858)
             if (params.repetition_penalty > 1.0f) {
-                if (adjusted[tok] > 0.0f) {
-                    adjusted[tok] /= params.repetition_penalty;
-                } else {
-                    adjusted[tok] *= params.repetition_penalty;
-                }
+                if (adjusted[tok] > 0.0f) adjusted[tok] /= params.repetition_penalty;
+                else                       adjusted[tok] *= params.repetition_penalty;
             }
-            // Frequency penalty: subtract penalty * count from logit
-            if (params.frequency_penalty > 0.0f) {
+            if (params.frequency_penalty > 0.0f)
                 adjusted[tok] -= params.frequency_penalty * count;
-            }
         }
     }
 
     if (params.temperature <= 0.0f) {
-        int max_i = 0;
-        for (int i = 1; i < vocab_size; i++) {
-            if (adjusted[i] > adjusted[max_i]) max_i = i;
-        }
+        // ============ PERF: vDSP_maxvi for greedy argmax ============
+        // Replaces O(vocab) scalar loop with SIMD max search.
+        float max_val;
+        vDSP_Length max_idx = 0;
+        vDSP_maxvi(adjusted, 1, &max_val, &max_idx, (vDSP_Length)vocab_size);
         free(adjusted);
-        return max_i;
+        return (int)max_idx;
     }
 
+    // ============ PERF: vDSP_vsmul for temperature scaling ============
+    // Replaces scalar loop with single SIMD multiply.
     float inv_t = 1.0f / params.temperature;
-    for (int i = 0; i < vocab_size; i++) adjusted[i] *= inv_t;
+    vDSP_vsmul(adjusted, 1, &inv_t, adjusted, 1, (vDSP_Length)vocab_size);
+
     softmax(adjusted, vocab_size);
 
     float r = (float)drand48();
