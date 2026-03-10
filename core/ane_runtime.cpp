@@ -102,6 +102,9 @@ struct ANEKernel {
     int nInputs, nOutputs;
     size_t* inputBytes;
     size_t* outputBytes;
+    // Cached IOSurface base addresses (avoid IOSurfaceGetBaseAddress per eval)
+    void** inputBaseAddrs;
+    void** outputBaseAddrs;
 };
 
 // ============ Global state ============
@@ -572,6 +575,8 @@ static ANEKernel* ane_compile_raw(id milText, id wdict,
     // Create IOSurfaces
     k->ioInputs = (IOSurfaceRef*)malloc(nInputs * sizeof(IOSurfaceRef));
     k->ioOutputs = (IOSurfaceRef*)malloc(nOutputs * sizeof(IOSurfaceRef));
+    k->inputBaseAddrs = (void**)malloc(nInputs * sizeof(void*));
+    k->outputBaseAddrs = (void**)malloc(nOutputs * sizeof(void*));
     for (int i = 0; i < nInputs; i++) {
         k->ioInputs[i] = ane_create_surface(inputSizes[i]);
         if (!k->ioInputs[i] || !ane_zero_surface(k->ioInputs[i])) {
@@ -590,6 +595,12 @@ static ANEKernel* ane_compile_raw(id milText, id wdict,
             return nullptr;
         }
     }
+
+    // Cache IOSurface base addresses (avoids IOSurfaceGetBaseAddress per eval call)
+    for (int i = 0; i < nInputs; i++)
+        k->inputBaseAddrs[i] = IOSurfaceGetBaseAddress(k->ioInputs[i]);
+    for (int i = 0; i < nOutputs; i++)
+        k->outputBaseAddrs[i] = IOSurfaceGetBaseAddress(k->ioOutputs[i]);
 
     // Create ANE request
     id wIns = ns_mutable_array(nInputs);
@@ -617,10 +628,17 @@ static ANEKernel* ane_compile_raw(id milText, id wdict,
     return k;
 }
 
+// Cached selector for hot-path eval (avoids sel_registerName hash lookup per call)
+static SEL g_eval_sel = nullptr;
+static std::once_flag g_eval_sel_once;
+
 static bool ane_eval_raw(ANEKernel* k) {
+    std::call_once(g_eval_sel_once, []() {
+        g_eval_sel = sel("evaluateWithQoS:options:request:error:");
+    });
     id e = nullptr;
     bool ok = ((bool(*)(id,SEL,unsigned int,id,id,id*))objc_msgSend)(
-        k->model, sel("evaluateWithQoS:options:request:error:"),
+        k->model, g_eval_sel,
         21, get_cached_empty_dict(), k->request, &e);
     if (!ok) {
         fprintf(stderr, "ANE eval failed: %s\n",
@@ -644,7 +662,7 @@ bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int
         fprintf(stderr, "ANE: IOSurfaceLock(input) failed\n");
         return false;
     }
-    uint16_t* in_base = (uint16_t*)IOSurfaceGetBaseAddress(in_surface);
+    uint16_t* in_base = (uint16_t*)k->inputBaseAddrs[0];  // cached, avoids IOKit call
 #if defined(__aarch64__) || defined(__arm64__)
     {
         __fp16* in_h = (__fp16*)in_base;
@@ -673,7 +691,7 @@ bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int
         fprintf(stderr, "ANE: IOSurfaceLock(output) failed\n");
         return false;
     }
-    const uint16_t* out_base = (const uint16_t*)IOSurfaceGetBaseAddress(out_surface);
+    const uint16_t* out_base = (const uint16_t*)k->outputBaseAddrs[0];  // cached
 #if defined(__aarch64__) || defined(__arm64__)
     {
         const __fp16* out_h = (const __fp16*)out_base;
@@ -763,6 +781,7 @@ void ane_free(ANEKernel* k) {
     }
     free(k->ioInputs); free(k->ioOutputs);
     free(k->inputBytes); free(k->outputBytes);
+    free(k->inputBaseAddrs); free(k->outputBaseAddrs);
     objc_release_obj(k->request);
     objc_release_obj(k->model);
     delete k;
