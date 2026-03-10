@@ -289,6 +289,33 @@ static id mil_gen_matmul(int out_dim, int in_dim) {
     return ns_data(buf, n);
 }
 
+
+// Batched matmul: uses height dimension for batch (N tokens at once)
+// Shape: [1, in_dim, N, 32] -> [1, out_dim, N, 32]
+static id mil_gen_matmul_batch(int out_dim, int in_dim, int batch) {
+    char buf[4096];
+    int n = snprintf(buf, sizeof(buf),
+        MIL_HEADER
+        "    func main<ios16>(tensor<fp16, [1, %d, %d, %d]> x) {\n"
+        "        tensor<fp16, [%d, %d, 1, 1]> W = const()[name = tensor<string, []>(\"W\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>(\"@model_path/weights/weight.bin\"), "
+        "offset = tensor<uint64, []>(64)))];" "\n"
+        "        tensor<string, []> pt = const()[name = tensor<string, []>(\"pt\"), val = tensor<string, []>(\"valid\")];" "\n"
+        "        tensor<int32, [2]> st = const()[name = tensor<string, []>(\"st\"), val = tensor<int32, [2]>([1, 1])];" "\n"
+        "        tensor<int32, [4]> pd = const()[name = tensor<string, []>(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];" "\n"
+        "        tensor<int32, [2]> dl = const()[name = tensor<string, []>(\"dl\"), val = tensor<int32, [2]>([1, 1])];" "\n"
+        "        tensor<int32, []> gr = const()[name = tensor<string, []>(\"gr\"), val = tensor<int32, []>(1)];" "\n"
+        "        tensor<fp16, [1, %d, %d, %d]> y = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = W, x = x)"
+        "[name = tensor<string, []>(\"cv\")];" "\n"
+        "    } -> (y);" "\n"
+        "}" "\n",
+        in_dim, batch, SP,
+        out_dim, in_dim, out_dim, in_dim,
+        out_dim, batch, SP);
+    return ns_data(buf, n);
+}
+
 static id mil_gen_fused_2(int a_out, int b_out, int in_dim) {
     int total_out = a_out + b_out;
     char buf[8192];
@@ -670,6 +697,60 @@ bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int
     return true;
 }
 
+// Batch matmul: process N tokens at once using height dimension
+// Input: [N * in_dim] contiguous float32 (N tokens, each in_dim floats)
+// Output: [N * out_dim] contiguous float32 (N tokens, each out_dim floats)
+// IOSurface layout: [1, dim, N, 32] where height=N, width=32
+bool ane_matvec_batch(ANEKernel* k, float* output, const float* input,
+                      int in_dim, int out_dim, int batch) {
+    IOSurfaceRef in_surface = k->ioInputs[0];
+    if (IOSurfaceLock(in_surface, 0, NULL) != kIOReturnSuccess) return false;
+    uint16_t* in_base = (uint16_t*)IOSurfaceGetBaseAddress(in_surface);
+#if defined(__aarch64__) || defined(__arm64__)
+    __fp16* in_h = (__fp16*)in_base;
+    // Layout: element[c, n, w] at offset c*batch*SP + n*SP + w
+    // Token n, channel c at w=0: offset = c*batch*SP + n*SP
+    for (int n = 0; n < batch; n++) {
+        const float* tok = input + n * in_dim;
+        for (int c = 0; c < in_dim; c++) {
+            in_h[c * batch * ANE_SPATIAL + n * ANE_SPATIAL] = (__fp16)tok[c];
+        }
+    }
+#else
+    for (int n = 0; n < batch; n++) {
+        const float* tok = input + n * in_dim;
+        for (int c = 0; c < in_dim; c++) {
+            in_base[c * batch * ANE_SPATIAL + n * ANE_SPATIAL] = f32_to_f16(tok[c]);
+        }
+    }
+#endif
+    IOSurfaceUnlock(in_surface, 0, NULL);
+
+    if (!ane_eval_raw(k)) return false;
+
+    IOSurfaceRef out_surface = k->ioOutputs[0];
+    if (IOSurfaceLock(out_surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+    const uint16_t* out_base = (const uint16_t*)IOSurfaceGetBaseAddress(out_surface);
+#if defined(__aarch64__) || defined(__arm64__)
+    const __fp16* out_h = (const __fp16*)out_base;
+    for (int n = 0; n < batch; n++) {
+        float* tok = output + n * out_dim;
+        for (int c = 0; c < out_dim; c++) {
+            tok[c] = (float)out_h[c * batch * ANE_SPATIAL + n * ANE_SPATIAL];
+        }
+    }
+#else
+    for (int n = 0; n < batch; n++) {
+        float* tok = output + n * out_dim;
+        for (int c = 0; c < out_dim; c++) {
+            tok[c] = f16_to_f32(out_base[c * batch * ANE_SPATIAL + n * ANE_SPATIAL]);
+        }
+    }
+#endif
+    IOSurfaceUnlock(out_surface, kIOSurfaceLockReadOnly, NULL);
+    return true;
+}
+
 void ane_free(ANEKernel* k) {
     if (!k) return;
     id e = nullptr;
@@ -702,6 +783,18 @@ ANEKernel* ane_compile_matmul(const uint16_t* bf16_weights, int out_dim, int in_
     id mil = mil_gen_matmul(out_dim, in_dim);
     size_t in_bytes = (size_t)in_dim * SP * sizeof(uint16_t);
     size_t out_bytes = (size_t)out_dim * SP * sizeof(uint16_t);
+    ANEKernel* r = ane_compile_raw(mil, wdict, 1, &in_bytes, 1, &out_bytes);
+    objc_autoreleasePoolPop(pool);
+    return r;
+}
+
+
+ANEKernel* ane_compile_matmul_batch(const uint16_t* bf16_weights, int out_dim, int in_dim, int batch) {
+    void* pool = objc_autoreleasePoolPush();
+    id wdict = build_weight_dict_1(bf16_weights, out_dim * in_dim, "weight");
+    id mil = mil_gen_matmul_batch(out_dim, in_dim, batch);
+    size_t in_bytes = (size_t)in_dim * batch * SP * sizeof(uint16_t);
+    size_t out_bytes = (size_t)out_dim * batch * SP * sizeof(uint16_t);
     ANEKernel* r = ane_compile_raw(mil, wdict, 1, &in_bytes, 1, &out_bytes);
     objc_autoreleasePoolPop(pool);
     return r;

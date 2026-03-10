@@ -54,7 +54,7 @@ private:
     int rope_cache_len_ = 0;
 
     static constexpr int KV_CACHE_CAPACITY = 2048;
-    static constexpr int LM_HEAD_ANE_CHUNK_MAX = 16384;
+    static constexpr int LM_HEAD_ANE_CHUNK_MAX = 65536;  // larger chunk = fewer dispatches
 
     struct LayerWeights {
         float* input_layernorm = nullptr;

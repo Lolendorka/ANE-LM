@@ -53,6 +53,14 @@ ANEKernel* ane_compile_fused_ffn_blob(const std::string& gate_path, const std::s
 // Kernel execution
 bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int out_dim);
 
+// Batch matmul: process N tokens in one ANE dispatch (for prefill)
+// Input: N dense fp32 vectors of size in_dim
+// Output: N dense fp32 vectors of size out_dim
+// Internally uses height dimension for batch: tensor shape [1, dim, N, 32]
+ANEKernel* ane_compile_matmul_batch(const uint16_t* bf16_weights, int out_dim, int in_dim, int batch);
+bool ane_matvec_batch(ANEKernel* k, float* output, const float* input,
+                      int in_dim, int out_dim, int batch);
+
 // Kernel cleanup
 void ane_free(ANEKernel* k);
 void ane_free_layer(LayerANEKernels* lk);
