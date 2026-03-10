@@ -1,4 +1,5 @@
 #include "qwen3_5.h"
+#include <ane_lm/common.h>
 #include "../../core/cpu_ops.h"
 #include <atomic>
 #include <cmath>
@@ -119,8 +120,8 @@ void Qwen35Model::reset() {
         if (layer_types_[L] == LayerType::FullAttention) {
             kv_caches_[L].len = 0;
             kv_caches_[L].start = 0;
-            memset(kv_caches_[L].k_cache, 0, (size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_ * sizeof(float));
-            memset(kv_caches_[L].v_cache, 0, (size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_ * sizeof(float));
+            memset(kv_caches_[L].k_cache, 0, (size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_ * sizeof(uint16_t));
+            memset(kv_caches_[L].v_cache, 0, (size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_ * sizeof(uint16_t));
         }
         if (layer_types_[L] == LayerType::LinearAttention) {
             memset(delta_states_[L].ssm_state, 0, (size_t)lin_num_val_heads_ * lin_key_dim_ * lin_val_dim_ * sizeof(float));
@@ -229,8 +230,8 @@ bool Qwen35Model::load(const std::string& model_dir) {
     for (int L = 0; L < num_layers_; L++) {
         if (layer_types_[L] == LayerType::FullAttention) {
             auto& kv = kv_caches_[L];
-            kv.k_cache = (float*)calloc((size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_, sizeof(float));
-            kv.v_cache = (float*)calloc((size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_, sizeof(float));
+            kv.k_cache = (uint16_t*)calloc((size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_, sizeof(uint16_t));
+            kv.v_cache = (uint16_t*)calloc((size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_, sizeof(uint16_t));
             kv.len = 0;
             kv.start = 0;
             kv.capacity = KV_CACHE_CAPACITY;
@@ -607,12 +608,61 @@ bool Qwen35Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int 
         if (cache.start >= cache.capacity) cache.start = 0;
     }
     size_t kv_stride = (size_t)num_kv_heads_ * head_dim_;
-    memcpy(cache.k_cache + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
-    memcpy(cache.v_cache + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
+    // fp32 -> fp16 on write (halves KV cache memory bandwidth during attention)
+    {
+        uint16_t* kslot = cache.k_cache + (size_t)slot * kv_stride;
+        uint16_t* vslot = cache.v_cache + (size_t)slot * kv_stride;
+#if defined(__aarch64__) || defined(__arm64__)
+        for (size_t _i = 0; _i < kv_stride; _i++) {
+            ((__fp16*)kslot)[_i] = (__fp16)k_raw[_i];
+            ((__fp16*)vslot)[_i] = (__fp16)v_raw[_i];
+        }
+#else
+        for (size_t _i = 0; _i < kv_stride; _i++) {
+            kslot[_i] = f32_to_f16(k_raw[_i]);
+            vslot[_i] = f32_to_f16(v_raw[_i]);
+        }
+#endif
+    }
 
-    gqa_attention(pre_oproj, q_gate_raw, cache.k_cache, cache.v_cache,
-                  num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
-                  cache.start, cache.len, cache.capacity);
+    // fp16 -> fp32 for gqa_attention (convert entire active region)
+    {
+        size_t active_kv = (size_t)cache.len * num_kv_heads_ * head_dim_;
+        float* k_f32 = (float*)alloca(active_kv * sizeof(float));
+        float* v_f32 = (float*)alloca(active_kv * sizeof(float));
+        // Copy from ring buffer, unwrapping if needed
+        int first_span = cache.capacity - cache.start;
+        if (first_span > cache.len) first_span = cache.len;
+        int second_span = cache.len - first_span;
+        size_t kv_row = (size_t)num_kv_heads_ * head_dim_;
+        size_t fs = (size_t)first_span * kv_row;
+#if defined(__aarch64__) || defined(__arm64__)
+        const __fp16* ksrc = (const __fp16*)cache.k_cache;
+        const __fp16* vsrc = (const __fp16*)cache.v_cache;
+        for (size_t _i = 0; _i < fs; _i++) {
+            k_f32[_i] = (float)ksrc[(size_t)cache.start * kv_row + _i];
+            v_f32[_i] = (float)vsrc[(size_t)cache.start * kv_row + _i];
+        }
+        for (size_t _i = 0; _i < (size_t)second_span * kv_row; _i++) {
+            k_f32[fs + _i] = (float)ksrc[_i];
+            v_f32[fs + _i] = (float)vsrc[_i];
+        }
+#else
+        for (size_t _i = 0; _i < fs; _i++) {
+            k_f32[_i] = f16_to_f32(cache.k_cache[(size_t)cache.start * kv_row + _i]);
+            v_f32[_i] = f16_to_f32(cache.v_cache[(size_t)cache.start * kv_row + _i]);
+        }
+        for (size_t _i = 0; _i < (size_t)second_span * kv_row; _i++) {
+            k_f32[fs + _i] = f16_to_f32(cache.k_cache[_i]);
+            v_f32[fs + _i] = f16_to_f32(cache.v_cache[_i]);
+        }
+#endif
+        // gqa_attention with linearized (unwrapped) fp32 KV cache
+        // cache_start=0 since we already unwrapped the ring buffer
+        gqa_attention(pre_oproj, q_gate_raw, k_f32, v_f32,
+                      num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
+                      0, cache.len, cache.len);
+    }
 
     if (attn_output_gate_) {
         for (int h = 0; h < num_q_heads_; h++) {

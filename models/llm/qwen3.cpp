@@ -1,4 +1,5 @@
 #include "qwen3.h"
+#include <ane_lm/common.h>
 #include "../../core/cpu_ops.h"
 #include <algorithm>
 #include <atomic>
@@ -83,8 +84,8 @@ Qwen3Model::~Qwen3Model() {
 void Qwen3Model::reset() {
     for (auto& kv : kv_caches_) {
         kv.len = 0; kv.start = 0;
-        memset(kv.k_cache, 0, (size_t)kv.capacity * num_kv_heads_ * head_dim_ * sizeof(float));
-        memset(kv.v_cache, 0, (size_t)kv.capacity * num_kv_heads_ * head_dim_ * sizeof(float));
+        memset(kv.k_cache, 0, (size_t)kv.capacity * num_kv_heads_ * head_dim_ * sizeof(uint16_t));
+        memset(kv.v_cache, 0, (size_t)kv.capacity * num_kv_heads_ * head_dim_ * sizeof(uint16_t));
     }
 }
 
@@ -155,8 +156,8 @@ bool Qwen3Model::load(const std::string& model_dir) {
     layers_.resize(num_layers_); kv_caches_.resize(num_layers_); ane_layers_.resize(num_layers_);
     for (int L = 0; L < num_layers_; L++) {
         auto& kv = kv_caches_[L];
-        kv.k_cache = (float*)calloc((size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_, sizeof(float));
-        kv.v_cache = (float*)calloc((size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_, sizeof(float));
+        kv.k_cache = (uint16_t*)calloc((size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_, sizeof(uint16_t));
+        kv.v_cache = (uint16_t*)calloc((size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_, sizeof(uint16_t));
         kv.len = 0; kv.start = 0; kv.capacity = KV_CACHE_CAPACITY;
     }
 
@@ -313,11 +314,53 @@ bool Qwen3Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int p
         if (cache.start >= cache.capacity) cache.start = 0;
     }
     size_t kv_stride = (size_t)num_kv_heads_ * head_dim_;
-    memcpy(cache.k_cache + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
-    memcpy(cache.v_cache + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
-    gqa_attention(pre_oproj, q_raw, cache.k_cache, cache.v_cache,
-                  num_q_heads_, num_kv_heads_, head_dim_, head_dim_,
-                  cache.start, cache.len, cache.capacity);
+    {
+        uint16_t* ks = cache.k_cache + (size_t)slot * kv_stride;
+        uint16_t* vs = cache.v_cache + (size_t)slot * kv_stride;
+#if defined(__aarch64__) || defined(__arm64__)
+        for (size_t _i = 0; _i < kv_stride; _i++) {
+            ((__fp16*)ks)[_i] = (__fp16)k_raw[_i];
+            ((__fp16*)vs)[_i] = (__fp16)v_raw[_i];
+        }
+#else
+        for (size_t _i = 0; _i < kv_stride; _i++) {
+            ks[_i] = f32_to_f16(k_raw[_i]);
+            vs[_i] = f32_to_f16(v_raw[_i]);
+        }
+#endif
+    }
+    {
+        size_t kv_row = (size_t)num_kv_heads_ * head_dim_;
+        float* k_f32 = (float*)alloca((size_t)cache.len * kv_row * sizeof(float));
+        float* v_f32 = (float*)alloca((size_t)cache.len * kv_row * sizeof(float));
+        int fs = cache.capacity - cache.start;
+        if (fs > cache.len) fs = cache.len;
+        int ss = cache.len - fs;
+#if defined(__aarch64__) || defined(__arm64__)
+        const __fp16* ksrc = (const __fp16*)cache.k_cache;
+        const __fp16* vsrc = (const __fp16*)cache.v_cache;
+        for (size_t _i = 0; _i < (size_t)fs * kv_row; _i++) {
+            k_f32[_i] = (float)ksrc[(size_t)cache.start * kv_row + _i];
+            v_f32[_i] = (float)vsrc[(size_t)cache.start * kv_row + _i];
+        }
+        for (size_t _i = 0; _i < (size_t)ss * kv_row; _i++) {
+            k_f32[(size_t)fs * kv_row + _i] = (float)ksrc[_i];
+            v_f32[(size_t)fs * kv_row + _i] = (float)vsrc[_i];
+        }
+#else
+        for (size_t _i = 0; _i < (size_t)fs * kv_row; _i++) {
+            k_f32[_i] = f16_to_f32(cache.k_cache[(size_t)cache.start * kv_row + _i]);
+            v_f32[_i] = f16_to_f32(cache.v_cache[(size_t)cache.start * kv_row + _i]);
+        }
+        for (size_t _i = 0; _i < (size_t)ss * kv_row; _i++) {
+            k_f32[(size_t)fs * kv_row + _i] = f16_to_f32(cache.k_cache[_i]);
+            v_f32[(size_t)fs * kv_row + _i] = f16_to_f32(cache.v_cache[_i]);
+        }
+#endif
+        gqa_attention(pre_oproj, q_raw, k_f32, v_f32,
+                      num_q_heads_, num_kv_heads_, head_dim_, head_dim_,
+                      0, cache.len, cache.len);
+    }
     return true;
 }
 

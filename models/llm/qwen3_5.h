@@ -136,8 +136,8 @@ private:
 
     // KV cache
     struct KVCache {
-        float* k_cache = nullptr;
-        float* v_cache = nullptr;
+        uint16_t* k_cache = nullptr;  // fp16 storage (halves memory bandwidth)
+        uint16_t* v_cache = nullptr;  // fp16 storage
         int len = 0;
         int start = 0;
         int capacity = 0;

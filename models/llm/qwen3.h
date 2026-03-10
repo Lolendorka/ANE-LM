@@ -64,8 +64,8 @@ private:
     };
 
     struct KVCache {
-        float* k_cache = nullptr;
-        float* v_cache = nullptr;
+        uint16_t* k_cache = nullptr;  // fp16
+        uint16_t* v_cache = nullptr;  // fp16
         int len = 0;
         int start = 0;
         int capacity = 0;
